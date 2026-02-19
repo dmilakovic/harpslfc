@@ -117,6 +117,28 @@ def evaluate_on_linelist(coefficients,linelist,fittype='gauss',polytype='ordinar
     
 
 def dispersion(coeffs2d,npix,nord):
+    '''
+    
+
+    Parameters
+    ----------
+    coeffs2d : TYPE
+        DESCRIPTION.
+    npix : TYPE
+        DESCRIPTION.
+    nord : INT
+        Optional, number of echelle orders. If provided, the array will have 
+        shape (nord, npix). Rows will be filled at the appropriate order. 
+                    
+                    This is used to ensure that the shape of the wavelength
+                    solution matches the shape of the data frame (flux)
+
+    Returns
+    -------
+    wavesol : TYPE
+        DESCRIPTION.
+
+    '''
     wavesol = disperse2d(coeffs2d,npix=npix,nord=nord)
     return wavesol
 

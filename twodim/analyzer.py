@@ -23,6 +23,14 @@ from .fitting import twoD_Gaussian
 from .plotting import (plot_gaussian_ellipse, plot_raw_data_stamps,
                        plot_normalized_residuals_stamps) # Keep per-segment plotters here
 
+GAUSS_PARAMS_NAME = ['AMPLITUDE',
+                     'CEN_X',
+                     'CEN_Y',
+                     'SIGMA_X',
+                     'SIGMA_Y',
+                     'THETA',
+                     'CONST']
+
 try:
     from .zernike_fitter import ZernikeFitter, ZERNPY_AVAILABLE, generate_zernike_indices
 except ImportError:
@@ -82,6 +90,7 @@ class EchelleAnalyzer:
         self.peak_catalog_fits_formats = None # Initialize
         self._define_results_dtype_and_formats() # Define ZERNIKE dtype
         self._define_peak_catalog_dtype()      # Define PEAK_CATALOG dtype
+        self._define_gauss2d_dtype_and_formats() # Define GAUSS2D dtype
 
 
 
@@ -202,6 +211,55 @@ class EchelleAnalyzer:
         self.peak_catalog_dtype = np.dtype(peak_dtype_list)
         # FITS formats for this simple table (no var-len)
         self.peak_catalog_fits_formats = ['J', 'I', 'J', 'J', 'J', 'E'] # Adjust if optional cols added
+        
+    def _define_gauss2d_dtype_and_formats(self):
+        """Defines the numpy dtype and FITS TFORM for the GAUSS2D parameters table."""
+        # Parameters from twoD_Gaussian: amplitude, xo, yo, sigma_x, sigma_y, theta_rad, offset
+        num_gauss_params = 7
+        
+
+        gauss2d_dtype_list = [
+            ('ORDER_NUM', 'i4'),      # Assigned final order number
+            ('IMGTYPE', 'i2'),      # 0=A, 1=B
+            ('SEGMENT', 'i4'),      # Assigned segment index within order/image
+            ('IDX', 'i4'),# Original index of the peak within the segment's input list
+            ('PEAK_X', 'i4'),    # Original integer X pixel coord of the peak
+            ('PEAK_Y', 'i4'),    # Original integer Y pixel coord of the peak
+            # ('GAUSS_PARAMS', f'{num_gauss_params}f4'), # amplitude, xo_s, yo_s, sx, sy, th_r, off_n
+            # ('GAUSS_ERRORS', f'{num_gauss_params}f4')
+            *((name,'f4',(2,)) for name in GAUSS_PARAMS_NAME)
+            # Optional: Add reduced_chi2 from the fit?
+            # ('RED_CHI2', 'f4')
+        ]
+        self.gauss2d_table_dtype = np.dtype(gauss2d_dtype_list)
+
+        # --- Generate corresponding FITS TFORM format strings ---
+        self.gauss2d_fits_formats = []
+        for name in self.gauss2d_table_dtype.names:
+            field_info = self.gauss2d_table_dtype.fields[name]
+            dtype = field_info[0]
+            kind = dtype.kind
+            itemsize = dtype.itemsize
+
+            if dtype.subdtype is not None: # Fixed vector (GAUSS_PARAMS, GAUSS_ERRORS)
+                 base_dtype, shape = dtype.subdtype
+                 base_kind = base_dtype.kind
+                 vec_len = shape[0]
+                 base_format = 'E' if base_kind == 'f' else 'J' # Assuming float or int
+                 self.gauss2d_fits_formats.append(f'{vec_len}{base_format}')
+            elif kind in 'iu':
+                if itemsize == 2: self.gauss2d_fits_formats.append('I')
+                elif itemsize == 4: self.gauss2d_fits_formats.append('J')
+                else: self.gauss2d_fits_formats.append('K')
+            elif kind == 'f':
+                 self.gauss2d_fits_formats.append('E' if itemsize == 4 else 'D')
+            else: # Fallback, should not be hit for this dtype
+                 warnings.warn(f"Unhandled kind '{kind}' for GAUSS2D column '{name}'. Using 'A'.")
+                 self.gauss2d_fits_formats.append('A')
+
+        if len(self.gauss2d_fits_formats) != len(self.gauss2d_table_dtype.names):
+             raise ValueError("Internal Error: Mismatch in GAUSS2D FITS formats and dtype fields.")
+        # print("Defined GAUSS2D table dtype and FITS formats.")
         
     def _ensure_fits_structure(self):
         """
@@ -370,6 +428,135 @@ class EchelleAnalyzer:
 
         except Exception as e:
             print(f"Error writing/appending to FITS file: {e}")
+            traceback.print_exc()
+            
+    def _update_gauss2d_fits_file(self, new_gauss_fit_list):
+        """
+        Writes or appends individual Gaussian fit results to the GAUSS2D BINTABLE.
+        """
+        if not new_gauss_fit_list: return
+        if not self._ensure_fits_structure():
+             print("Error: Cannot ensure base FITS file structure for GAUSS2D.")
+             return
+        if self.gauss2d_table_dtype is None or self.gauss2d_fits_formats is None:
+             print("Error: GAUSS2D table dtype or FITS formats not defined."); return
+
+        print(f"Updating FITS file {self.output_fits_path} with {len(new_gauss_fit_list)} GAUSS2D candidate result(s)...")
+        extname = 'GAUSS2D'
+        col_names = list(self.gauss2d_table_dtype.names)
+        col_formats = self.gauss2d_fits_formats
+
+        try:
+            with fitsio.FITS(self.output_fits_path, 'rw') as fits:
+                hdu_exists = extname in fits
+                rows_to_write_or_append = []
+                existing_keys = set()
+
+                if hdu_exists:
+                    try:
+                        existing_data = fits[extname].read(columns=['ORDER_NUM', 'IMGTYPE', 'SEGMENT', 'IDX'])
+                        if existing_data is not None and len(existing_data) > 0:
+                             existing_keys = set(zip(existing_data['ORDER_NUM'], existing_data['IMGTYPE'],
+                                                     existing_data['SEGMENT'], existing_data['IDX']))
+                        # print(f"  Read {len(existing_keys)} existing GAUSS2D keys for duplicate check.") # Less verbose
+                    except Exception as e:
+                        print(f"Warning: Could not read existing keys from {extname}: {e}. Proceeding without duplicate check for this batch.")
+                        existing_keys = set()
+
+                    num_duplicates = 0
+                    valid_new_entries = [] # Filter for non-None entries first
+                    for item in new_gauss_fit_list:
+                        if isinstance(item, dict): # Ensure item is a dictionary
+                            valid_new_entries.append(item)
+                        else:
+                            print(f"Warning: Encountered a non-dictionary item in new_gauss_fit_list: {type(item)}. Skipping.")
+                    
+                    for result_dict in valid_new_entries:
+                        try: # Add try-except for key access, though 'isinstance' should prevent None
+                            key = (result_dict['ORDER_NUM'], result_dict['IMGTYPE'],
+                                   result_dict['SEGMENT'], result_dict['IDX'])
+                            if key not in existing_keys:
+                                rows_to_write_or_append.append(result_dict)
+                            else:
+                                num_duplicates +=1
+                        except TypeError as te: # Should be caught by isinstance now
+                            print(f"Warning: TypeError accessing keys in GAUSS2D result_dict (was it None?): {result_dict}. Error: {te}")
+                        except KeyError as ke:
+                            print(f"Warning: Missing key in GAUSS2D result_dict: {ke}. Dict: {result_dict}")
+
+                    if num_duplicates > 0: print(f"  Skipped {num_duplicates} duplicate GAUSS2D entries.")
+                else:
+                    # If HDU doesn't exist, filter for valid dictionaries before assigning
+                    for item in new_gauss_fit_list:
+                        if isinstance(item, dict):
+                            rows_to_write_or_append.append(item)
+                        else:
+                            print(f"Warning: Encountered a non-dictionary item when creating GAUSS2D HDU: {type(item)}. Skipping.")
+                    if rows_to_write_or_append:
+                        print(f"  {extname} HDU not found. Will create and write {len(rows_to_write_or_append)} new rows.")
+
+                if not rows_to_write_or_append:
+                     print("  No new unique GAUSS2D results to write/append.")
+                     return
+
+                # Convert list of dicts to structured array
+                output_struct = np.zeros(len(rows_to_write_or_append), dtype=self.gauss2d_table_dtype)
+                valid_rows_for_struct = 0
+                for i, row_dict in enumerate(rows_to_write_or_append):
+                    # At this point, row_dict should absolutely be a dictionary.
+                    # The error location suggests it is not.
+                    # The added isinstance checks above should prevent Nones from reaching here.
+                    if not isinstance(row_dict, dict): # Defensive check, should have been filtered
+                        print(f"Critical Warning: row_dict at index {i} is not a dict: {type(row_dict)}. This should not happen.")
+                        continue 
+
+                    try:
+                        for name in self.gauss2d_table_dtype.names:
+                            if name in row_dict: # This is where the original error was
+                                output_struct[valid_rows_for_struct][name] = row_dict[name]
+                            # else: # Optional: Warning for missing keys, but might be too verbose
+                            #    print(f"Debug: Key '{name}' not in row_dict for GAUSS2D struct. Keys: {list(row_dict.keys())}")
+                        valid_rows_for_struct += 1
+                    except Exception as e:
+                        print(f"Error populating structured array for GAUSS2D row {i} (data: {row_dict}): {e}")
+                        # Optionally, fill this row with NaNs or skip it
+                        # For now, we just don't increment valid_rows_for_struct if there's an error for THIS row
+
+                if valid_rows_for_struct == 0:
+                    print("  No valid rows could be prepared for GAUSS2D structured array.")
+                    return
+                
+                # Slice output_struct to only include validly populated rows
+                final_output_struct = output_struct[:valid_rows_for_struct]
+
+
+                if hdu_exists:
+                    if len(final_output_struct) > 0:
+                        print(f"  Appending {len(final_output_struct)} rows to {extname} HDU...")
+                        fits[extname].append(final_output_struct)
+                    else:
+                        print(f"  No valid GAUSS2D rows to append after final checks.")
+                else:
+                    if len(final_output_struct) > 0:
+                        print(f"  Writing new {extname} HDU with {len(final_output_struct)} rows...")
+                        gauss2d_hdr = fitsio.FITSHDR()
+                        gauss2d_hdr['EXTNAME'] = extname
+                        gauss2d_hdr['COMMENT'] = 'Parameters of 2D Gaussian fits to individual lines.'
+                        gauss2d_hdr['COMMENT'] = 'GAUSS_PARAMS: amplitude, xo_stamp, yo_stamp, sigma_x, sigma_y, theta_rad, offset'
+                        fits.write_table(
+                            data=final_output_struct,
+                            names=col_names,
+                            formats=col_formats,
+                            header=gauss2d_hdr,
+                            extname=extname
+                        )
+                    else:
+                        print(f"  No valid GAUSS2D rows to write for new HDU after final checks.")
+                
+                if len(final_output_struct) > 0:
+                    print(f"  Successfully wrote/appended {len(final_output_struct)} GAUSS2D results.")
+        except Exception as e:
+            print(f"Error writing/appending GAUSS2D to FITS file: {e}")
             traceback.print_exc()
             
     def load_data(self, detector='red'):
@@ -591,10 +778,12 @@ class EchelleAnalyzer:
             'x_rotated': rel_x_rot.ravel().astype('f4'),
             'y_rotated': rel_y_rot.ravel().astype('f4'),
             'z_norm': stamp_norm.ravel().astype('f4'),
+            'pars': np.asarray([amp_n, xc_abs, yc_abs, sx, sy, th_major, off_n]),
+            'perr': perr.astype('f4'),
             'plot_info': {
                 'stamp_data': stamp_data, 'residuals_norm_2d': res_div_sig.reshape(stamp_h, stamp_w),
                 'xo_stamp': xc_s, 'yo_stamp': yc_s, 'sigma_x': sx, 'sigma_y': sy,
-                'theta_rad': th, 'chi2_reduced': red_chi2
+                'theta_rad': th_major, 'chi2_reduced': red_chi2
             }
         }
 
@@ -619,6 +808,8 @@ class EchelleAnalyzer:
 
         print(f"-- Computing: Order {order_num}, ImgType {img_type_int}, Segment {segment_idx} ({len(segment_peaks_xy)} peaks) --")
         segment_results_x, segment_results_y, segment_results_z = [], [], []
+        # segment_results_pars, segment_results_errs = []
+        individual_gauss_fits = []
         plotting_info_list = []
         num_peaks_processed = 0
 
@@ -628,6 +819,23 @@ class EchelleAnalyzer:
                 segment_results_x.append(processed_stamp['x_rotated'])
                 segment_results_y.append(processed_stamp['y_rotated'])
                 segment_results_z.append(processed_stamp['z_norm'])
+                # --- Collect Gaussian fit data for GAUSS2D table ---
+                segment_results_dict = {
+                    'ORDER_NUM': order_num,
+                    'IMGTYPE': img_type_int,
+                    'SEGMENT': segment_idx,
+                    'IDX': i, # Index within the input segment_peaks_xy
+                    'PEAK_X': peak_xy[0],
+                    'PEAK_Y': peak_xy[1],
+                    'CHISQ': processed_stamp['plot_info']['chi2_reduced'],
+                    'THETA_MAJOR': processed_stamp['plot_info']['theta_rad']
+                    }
+                parameters_dict = dict((name,((processed_stamp['pars'][k], 
+                                               processed_stamp['perr'][k])))
+                    for k,name in enumerate(GAUSS_PARAMS_NAME))
+                segment_results_dict.update(parameters_dict)
+                individual_gauss_fits.append(segment_results_dict)
+                
                 num_peaks_processed += 1
                 if plot_stamps:
                      processed_stamp['plot_info']['peak_index'] = i
@@ -638,13 +846,23 @@ class EchelleAnalyzer:
         median_x, median_y = median_pos
         coeffs_nan = np.full(len(self.zernike_indices) if self.zernike_indices else 0, np.nan, dtype='f4')
         base_output = {
-            'ORDER_NUM': order_num, 'IMGTYPE': img_type_int, 'SEGMENT': segment_idx,
-            'N_MAX_ZERN': self.params['n_max_zern'], 'R_MAX_ZERN': self.params['r_max_zern'],
-            'NUM_PEAKS_PROC': num_peaks_processed, 'NUM_PIX_STACKED': 0,
-            'MEDIAN_X': median_x, 'MEDIAN_Y': median_y, 'FIT_SUCCESS': False,
-            'RMSE': np.nan, 'R_SQUARED': np.nan,
-            'COEFFS': coeffs_nan, 'ERR_COEFFS': coeffs_nan,
-            'X_STACK': np.array([], dtype='f4'), 'Y_STACK': np.array([], dtype='f4'), 'Z_STACK': np.array([], dtype='f4')
+            'ORDER_NUM': order_num, 
+            'IMGTYPE': img_type_int, 
+            'SEGMENT': segment_idx,
+            'N_MAX_ZERN': self.params['n_max_zern'], 
+            'R_MAX_ZERN': self.params['r_max_zern'],
+            'NUM_PEAKS_PROC': num_peaks_processed, 
+            'NUM_PIX_STACKED': 0,
+            'MEDIAN_X': median_x, 
+            'MEDIAN_Y': median_y, 
+            'FIT_SUCCESS': False,
+            'RMSE': np.nan, 
+            'R_SQUARED': np.nan,
+            'COEFFS': coeffs_nan, 
+            'ERR_COEFFS': coeffs_nan,
+            'X_STACK': np.array([], dtype='f4'), 
+            'Y_STACK': np.array([], dtype='f4'), 
+            'Z_STACK': np.array([], dtype='f4')
         }
         if not segment_results_x: print(f"Segment {segment_idx}: No peaks processed."); return base_output
 
@@ -656,7 +874,11 @@ class EchelleAnalyzer:
 
         # Update output dict with stacked data
         base_output.update({'NUM_PIX_STACKED': num_pixels_stacked,
-                           'X_STACK': X_stack, 'Y_STACK': Y_stack, 'Z_STACK': Z_stack})
+                           'X_STACK': X_stack, 
+                           'Y_STACK': Y_stack, 
+                           'Z_STACK': Z_stack,
+                           }
+                           )
 
 
         # --- Plotting Stamps ---
@@ -719,7 +941,7 @@ class EchelleAnalyzer:
             else: print(f"Segment {segment_idx}: Zernike fit failed. {fitter.message}")
         # else: (Handle other skipped cases if needed)
 
-        return base_output # Return computed results
+        return base_output, individual_gauss_fits # Return computed results
 
     
 
@@ -749,6 +971,8 @@ class EchelleAnalyzer:
              print("Error or Warning: Could not write or verify PEAK_CATALOG HDU. Proceeding without it.")
              # Continue analysis, but peak retrieval later might fail
 
+        all_gauss_fits_for_batch_update = []
+        
         # --- Loop through orders and images for Zernike analysis ---
         for order_num in orders_to_process:
              if order_num not in self.paired_orders_dict: print(f"Skipping order {order_num} - not found."); continue
@@ -766,24 +990,31 @@ class EchelleAnalyzer:
                  peaks_sorted = peaks_full_order[np.argsort(peaks_full_order[:, 0])] # Sort by X
                  segmented_peaks_list = np.array_split(peaks_sorted, self.params['num_segments']) # List of arrays
 
-                 results_for_this_batch = []
+                 results_for_zernike_batch = []
+                 results_for_gauss2d_batch = []
                  for segment_idx, segment_peaks in enumerate(segmented_peaks_list):
                       if len(segment_peaks) < self.params['cluster_min_samples']:
                           print(f"--- Skipping Zernike Analysis for Segment {segment_idx} (Too few peaks: {len(segment_peaks)}) ---")
                           continue
 
                       # --- Compute results for the segment (Zernike fit, etc.) ---
-                      segment_result = self._analyze_segment_compute_only(
-                          segment_peaks, order_num, img_type_int, segment_idx, plot_config
+                      zernike_segment_summary, individual_gauss_fits_for_segment = \
+                          self._analyze_segment_compute_only(
+                              segment_peaks, order_num, img_type_int, segment_idx, plot_config
                           )
-                      if segment_result:
-                          results_for_this_batch.append(segment_result)
+                      if zernike_segment_summary:
+                          results_for_zernike_batch.append(zernike_segment_summary)
                           # total_segments_computed only counts Zernike results
-                          total_segments_computed += 1 if segment_result['FIT_SUCCESS'] or segment_result['NUM_PEAKS_PROC'] > 0 else 0
+                          total_segments_computed += 1 if zernike_segment_summary['FIT_SUCCESS'] or zernike_segment_summary['NUM_PEAKS_PROC'] > 0 else 0
+                      if individual_gauss_fits_for_segment:
+                          self._update_gauss2d_fits_file(individual_gauss_fits_for_segment)
+                          
 
                  # --- Update ZERNIKE HDU after processing all segments for this order/image ---
-                 if results_for_this_batch:
-                      self._update_fits_file(results_for_this_batch) # Appends/writes to ZERNIKE HDU
+                 if results_for_zernike_batch:
+                      self._update_fits_file(results_for_zernike_batch) # Appends/writes to ZERNIKE HDU
+                      
+                      
 
                  print(f"===== Finished ZERNIKE update for Order {order_num}, Image {img_type_str} =====")
 

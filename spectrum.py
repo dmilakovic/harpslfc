@@ -798,38 +798,7 @@ class Spectrum(object):
     def wavereference_object(self,waveref_object):
         """ Input is a wavesol.ThAr object or wavesol.ThFP object """
         self._wavereference = waveref_object
-    # @property
-    # def normalised_flux(self):
-    #     try:
-    #         flx_norm = self._cache['normalised_flux']
-    #     except:
-    #         flx_norm, err_norm, bkg_norm  = laux.prepare_data(
-    #                                                 self.flux, 
-    #                                                 # self.error, 
-    #                                                 self.envelope,
-    #                                                 self.background, 
-    #                                                 subbkg=hs.subbkg, 
-    #                                                 divenv=hs.divenv
-    #                                                 )
-    #         self._cache['normalised_flux']=flx_norm
-    #         self._cache['normalised_error']=err_norm
-    #     return flx_norm  
-    # @property
-    # def normalised_error(self):
-    #     try:
-    #         err_norm = self._cache['normalised_error']
-    #     except:
-    #         flx_norm, err_norm, bkg_norm  = laux.prepare_data(
-    #                                                 self.flux, 
-    #                                                 self.error, 
-    #                                                 self.envelope,
-    #                                                 self.background, 
-    #                                                 subbkg=hs.subbkg, 
-    #                                                 divenv=hs.divenv
-    #                                                 )
-    #         self._cache['normalised_flux']=flx_norm
-    #         self._cache['normalised_error']=err_norm
-    #     return err_norm  
+    
     
     
 
@@ -845,7 +814,7 @@ class Spectrum(object):
             linedict = lines.fit(self,orders)
             return linedict
         
-    def process(self,fittype=['gauss','lsf'],):
+    def process(self,fittype=['gauss','lsf'],do_comb_specific=True):
         # if isinstance(settings,str):
         #     settings_dict = hs.Settings(settings)
         # elif isinstance(settings,dict):
@@ -861,7 +830,7 @@ class Spectrum(object):
             version=self.version,
             fittype=np.atleast_1d(fittype),
             remove_false_lines=True,
-            do_comb_specific=True,
+            do_comb_specific=do_comb_specific,
             overwrite=True,
             )
         
@@ -1095,7 +1064,7 @@ class Spectrum(object):
                 for i,ft in enumerate(fittypes):
                     model1d = model2d[ft][order]
                     ax.plot(x,model1d,c=colors[ft],drawstyle='steps-mid',
-                                 label='Model {}'.format(ft),)
+                                 label='Model {}'.format(ft),ls='--')
             if shwbkg==True:
                 bkg1d = self['background'][order]
                 ax.plot(x,bkg1d,label='Background',#drawstyle='steps-mid',
@@ -1306,7 +1275,7 @@ class Spectrum(object):
             order:      integer of list or orders to be plotted
             kind:       'lines' or 'wavesol'
             xscale:     'pixel' or 'wave'
-            yscale:     'velocity' or 'angstrom'
+            yscale:     'velocity' (default) or 'angstrom'
             plotter:    Figure class object from harps.plotter (opt), 
                         default None.
         Returns:
@@ -2120,7 +2089,7 @@ class Spectrum(object):
     
 class ESPRESSO(Spectrum):
     def __init__(self,filepath,wavereference,fr=None,f0=None,vacuum=True,
-                 sOrder=60,eOrder=170,dllfile=None,*args,**kwargs):
+                 sOrder=40,eOrder=170,dllfile=None,*args,**kwargs):
         ext = 1 
         self._cache   = {}
         self.instrument = "ESPRESSO"
@@ -2316,30 +2285,59 @@ def process(spec,settings_dict):
         filepath (str): path to the e2ds file
     '''
     import logging
-    def get_item(spec,item,version,**kwargs):
-        # print(item,version)
-        try:
-            itemdata = spec[item,version]
-            message  = 'saved'
-            #print("FILE {}, ext {} success".format(filepath,item))
-            del(itemdata)
+    # def get_item(spec,item,version,**kwargs):
+    #     # print(item,version)
+    #     try:
+    #         itemdata = spec[item,version]
+    #         message  = 'saved'
+    #         #print("FILE {}, ext {} success".format(filepath,item))
+    #         del(itemdata)
         
-        except:
-            message  = 'calculating (write=True)'
-            try:
-                itemdata = spec(item,version,write=True)
-                del(itemdata)
-            except:
-                message = 'FAILED'
+    #     except:
+    #         message  = 'calculating (write=True)'
+    #         try:
+    #             itemdata = spec(item,version,write=True)
+    #             del(itemdata)
+    #         except:
+    #             message = 'FAILED'
             
+    #     finally:
+    #         msg = "SPECTRUM {}".format(spec.filepath) +\
+    #                     " item {}".format(item.upper()) +\
+    #                     " version {}".format(version) +\
+    #                     " {}".format(message)
+    #         # print(msg)
+    #         logger.info(msg)
+    #     return
+    def get_item(spec, item, version=None, **speckwargs):
+        try:
+            if version is None:
+                itemdata = spec[item]
+            else:
+                itemdata = spec[item, version]
+            message = 'exists (nothing happened)'
+            del itemdata
+    
+        except Exception:
+            message = 'calculating and saving'
+            try:
+                if version is None:
+                    itemdata = spec(item, write=True, **speckwargs)
+                else:
+                    itemdata = spec(item, version, write=True, **speckwargs)
+                del itemdata
+            except Exception:
+                message = 'FAILED'
+    
         finally:
-            msg = "SPECTRUM {}".format(spec.filepath) +\
-                        " item {}".format(item.upper()) +\
-                        " version {}".format(version) +\
-                        " {}".format(message)
-            # print(msg)
+            msg = (
+                f"SPECTRUM {spec.filepath} "
+                f"item {item.upper()} "
+                f"version {version} "
+                f"{message}"
+            )
             logger.info(msg)
-        return
+        
     def comb_specific(fittype):
         comb_items = ['coeff','wavesol','residuals','model']
         return ['{}_{}'.format(item,fittype) for item in comb_items]
@@ -2353,12 +2351,17 @@ def process(spec,settings_dict):
     for item in basic:
         get_item(spec,item,None)
         
-    
-    linelist = spec('linelist',order=(settings_dict['sOrder'],
-                                      settings_dict['eOrder']),write=True,
-                    fittype=settings_dict['fittype'],
-                    # fittype=['gauss']
-                    )
+    get_item(spec,
+             'linelist',
+             version=None,
+             order=(settings_dict['sOrder'], settings_dict['eOrder']),
+             fittype=settings_dict['fittype'],
+            )
+    # linelist = spec('linelist',order=(settings_dict['sOrder'],
+    #                                   settings_dict['eOrder']),write=True,
+    #                 fittype=settings_dict['fittype'],
+    #                 # fittype=['gauss']
+    #                 )
  
     
     

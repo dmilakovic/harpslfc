@@ -265,7 +265,8 @@ def curve(f, xdata, ydata, p0=None, sigma=None, absolute_sigma=False,
 #                         L I N E      F I T T I N G                  
 #
 #==============================================================================
-default_line_class = 'SimpleGaussian'
+# default_line_class = 'SimpleGaussian'
+default_line_class = 'SingleGaussian'
 def gauss(x,flux,error,
           line_class=default_line_class,
           output_model=False,
@@ -433,7 +434,7 @@ def poly(polytype,centers,wavelengths,cerror,werror,polyord):
 # Assumption: Frequencies are known with 1MHz accuracy
 freq_err = 2e4
 def dispersion(linelist,version,fittype,npix,errorfac=1,polytype='ordinary',
-               anchor_offset=None,
+               anchor_offset=None, 
                limit=None,q=None):
     """
     Fits the wavelength solution to the data provided in the linelist.
@@ -447,6 +448,7 @@ def dispersion(linelist,version,fittype,npix,errorfac=1,polytype='ordinary',
         fittype   : centers to use, 'gauss' or 'lsf'
         npix      : number of pixels, used for normalisation to domain (-1,1).
         errorfac  : multiplier for the center error array
+        
     Returns:
     -------
         wavesol2d : a structured array with coefficients

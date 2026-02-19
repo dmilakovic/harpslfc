@@ -1713,7 +1713,7 @@ def process_spectrum2d(flux2d,
 
     # Iterate over each row (axis=0)
     for row_idx in range(n_rows):
-        progress_bar.update(row_idx/(n_rows-1),f'{row_idx}/{n_rows}')
+        progress_bar.update(row_idx/(n_rows-1),f'Peakdetect {row_idx}/{n_rows}')
         if row_idx<sOrder:
             continue
         if verbose:

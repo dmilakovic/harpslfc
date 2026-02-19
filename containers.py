@@ -30,6 +30,7 @@ def datashapes(name,**kwargs):
                'id':('id','u4',()),
                'order':('order','u4',()),
                'optord':('optord','u4',()),
+               'slice':('slice', 'u4', ()),
                'index':('index','u4',()),
                'pixl':('pixl','u4',()),
                'pixr':('pixr','u4',()),
@@ -87,7 +88,7 @@ def create_dtype(name,fmt,shape):
 def array_dtype(arraytype):
     assert arraytype in ['linelist','residuals','radial_velocity','linepars']
     if arraytype=='linelist':
-        names = ['id','order','optord','index','pixl','pixr',
+        names = ['id','order','optord','slice','index','pixl','pixr',
                  'segm','bary','bmean','skew','freq','mode',
                  #'anchor','reprate',
                  'noise','snr','resolution','sumbkg','sumflx',

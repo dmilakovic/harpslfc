@@ -17,7 +17,8 @@ import harps.plotter as hplt
 from scipy.optimize import leastsq, brentq, least_squares, OptimizeWarning
 from scipy.optimize._lsq.least_squares import prepare_bounds
 from scipy.linalg import svd
-from scipy.special import erf, erfc
+from scipy.special import erf, erfc, voigt_profile, dawsn
+from scipy.signal import convolve
 
 #import scipy.interpolate as interpolate
 
@@ -232,11 +233,11 @@ class EmissionLine(object):
             #jac = '2-point'
             pass
         if method == 'lm':    
-            # wrapped_jac = self._wrap_jac(self.jacobian,self.xdata,self.yerr)
+            wrapped_jac = self._wrap_jac(self.jacobian,self.xdata)
             #
             res = leastsq(self.residuals,p0,
-                           Dfun=None,
-                           # Dfun=wrapped_jac,
+                            Dfun=None,
+                            # Dfun=wrapped_jac,
                           full_output=True,col_deriv=False,**kwargs)
             pfit, pcov, infodict, errmsg, ier = res
             #print(errmsg)
@@ -249,10 +250,11 @@ class EmissionLine(object):
             else:
                 success = True
         else:
-            # print(f'Bounded problem {method=:}')
+            print(f'Bounded problem {method=:}, using jacobian')
             # print(p0, bounds)
             res = least_squares(self.residuals, p0, jac=self.jacobian,
                                 bounds=bounds, method=method,
+                                x_scale='jac',
                                 **kwargs)
             # print(f'{res.success=:}')
             if not res.success:
@@ -331,7 +333,10 @@ class EmissionLine(object):
         self.success = success
         self.cost = cost
         if full_output:
-            return pfit, errors, infodict, errmsg, ier
+            if method == 'lm':
+                return pfit, errors, infodict, errmsg, ier
+            else: 
+                return pfit, errors, res
         else:
             return pfit, errors
     
@@ -556,7 +561,7 @@ class SingleGaussian(EmissionLine):
         
 class SimpleGaussian(EmissionLine):
     '''Single gaussian model of an emission line, without error function'''
-    def model(self,pars,separate=False):
+    def model(self,pars,xdata=None,separate=False):
         ''' Calculates the expected electron counts by assuming:
             (1) The PSF is a Gaussian function,
             (2) The number of photons falling on each pixel is equal to the 
@@ -569,7 +574,7 @@ class SimpleGaussian(EmissionLine):
         Where A, mu, and sigma are the amplitude, mean, and the variance 
         of the Gaussian.
         '''
-        x  = self.xdata
+        x  = xdata if xdata is not None else self.xdata 
         
         if len(pars)==5:
             A, mu, sigma, m, y0 = pars
@@ -663,6 +668,196 @@ class SimpleGaussian(EmissionLine):
             return  cdf - 0.5
         x = brentq(eq,np.min(self.xdata),np.max(self.xdata))
         return x    
+    
+    
+class CombLineVoigt(EmissionLine):
+    def __init__(self):
+        super().__init__()
+        self.subbin_factor = 21  # Essential for precision [2]
+        # Look-up tables for H_n and H_n,u are assumed globally available 
+        # as per Webb & Lee [3, 4]
+        
+    def _initialize_parameters(self,xdata,ydata,npars=5):
+        ''' Method to initialize parameters from data (pre-fit)
+        Returns:
+        ----
+            p0: tuple with inital (amplitude, mean, sigma) values
+        '''
+        A0 = 10*np.max(self.ydata)
+        
+        mu_0 = np.average(xdata,weights=ydata)
+        sigma_int0 = 2e-1
+        gamma_int0 = 5e-1
+        sigma_inst0 = np.sqrt(np.var(xdata))/4
+        p0 = (A0, mu_0, sigma_int0, gamma_int0, sigma_inst0)
+        self.initial_parameters = p0
+        return p0
+
+    def _initialize_bounds(self):
+        """Sets strict limits on intrinsic width [5]."""
+        bary = np.average(self.xdata, weights=self.ydata)
+        # Parameters: (A, mu, sigma_int, gamma_int, sigma_inst)
+        # Intrinsic widths limited to < 1 pixel as requested
+        lb = (0.1 * np.max(self.ydata), bary - 1.0, 1e-6, 1e-6, 0.1)
+        ub = (20.0 * np.max(self.ydata), bary + 1.0, 1.0, 2.0, 3.0)
+        return (lb, ub)
+
+    def model(self, pars, xdata=None):
+        '''
+        A Voigt profile convolved by a Gaussian instrumental profile. 
+        Parameters are Amplitude (A), Center (μ), Intrinsic Gaussian width 
+        (σ_int), Intrinsic Lorentzian width (γ_int), and instrumental 
+        Gaussian width (σ_inst)
+        
+        ----------
+        pars : TYPE
+            DESCRIPTION.
+        xdata : TYPE, optional
+            DESCRIPTION. The default is None.
+
+        Returns
+        -------
+        TYPE
+            DESCRIPTION.
+
+        '''
+        
+        x = xdata if xdata is not None else self.xdata
+        A, mu, s_int, g_int, s_inst = pars
+        s_int = np.abs(s_int)
+        g_int = np.abs(g_int)
+        s_inst = np.abs(s_inst)
+        
+        # Sub-binning grid for accuracy [2]
+        dx = np.diff(x).min() / self.subbin_factor
+        x_fine = np.arange(x.min() - 5, x.max() + 5, dx)
+        
+        # 1. Intrinsic Voigt Profile (I_nu)
+        H_sum = voigt_profile(x_fine - mu, s_int, g_int)
+        # u = (x_fine - mu) / s_inst
+        # a = g_int / s_int
+        
+        # H_sum   = sum([ (a**n) * get_Hn(n, u) for n in range(4) ])
+        
+        I_nu = A * H_sum
+        
+        # 2. Instrumental Gaussian Kernel (G)
+        g_x = np.arange(-5 * s_inst, 5 * s_inst, dx)
+        G = np.exp(-0.5 * (g_x / s_inst)**2)
+        G /= G.sum() # Normalization [6]
+        
+        # 3. Convolution [1, 6]
+        convolved = convolve(I_nu, G, mode='same')
+        return np.interp(x, x_fine, convolved)
+
+    def jacobian(self, pars, xdata=None, yerr=None):
+        A, mu, s_int, g_int, s_inst = pars
+        x = xdata if xdata is not None else self.xdata
+        yerr = yerr if yerr is not None else self.yerr
+        # 1. Setup Fine Grid for Convolution
+        dx = np.diff(x).min() / self.subbin_factor
+        x_fine = np.arange(x.min() - 5, x.max() + 5, dx)
+        u = (x_fine - mu) / s_int
+        a = g_int / s_int
+    
+        # 2. Compute Instrumental Kernel G and its Derivative
+        g_x = np.arange(-5 * s_inst, 5 * s_inst, dx)
+        G = np.exp(-0.5 * (g_x / s_inst)**2)
+        G_norm = G / G.sum()
+        dG_ds_inst = G_norm * (g_x**2 / s_inst**3 - 1/s_inst)
+    
+        # 3. Calculate Analytic Intrinsic Derivatives (from Look-up Tables/Taylor)
+        # H_n(u) and H_n,u(u) are the Taylor expansion terms
+        # H_sum   = sum([ (a**n) * get_Hn(n, u) for n in range(4) ])
+        H_sum   = voigt_profile(x_fine - mu, s_int, g_int)
+        Hu_sum  = sum([ (a**n) * get_Hnu(n, u) for n in range(4) ])
+        Ha_sum  = sum([ n * (a**(n-1)) * get_Hn(n, u) for n in range(1, 4) ])
+    
+        I_nu = A * H_sum
+    
+        # Derivative w.r.t Amplitude (A)
+        dI_dA = H_sum 
+        
+        # Derivative w.r.t Center (mu) - Eq 26 mapping
+        # dI/dmu = A * (dH/du) * (du/dmu) where du/dmu = -1/s_int
+        dI_dmu = - (A / s_int) * Hu_sum 
+        
+        # Derivative w.r.t Intrinsic Width (sigma_int) - Eq 27 mapping
+        # dI_ds_int = (A / s_int) * (H_sum + u * Hu_sum + a * Ha_sum)
+        dI_ds_int = (A / s_int) * ( - Ha_sum + mu / s_int * Hu_sum)
+        
+        # Derivative w.r.t Intrinsic Lorentzian (gamma_int) - Eq 29 mapping
+        dI_dg_int = (A / s_int) * Ha_sum
+        
+    
+        # 4. Apply Derivative Convolution Theorem [Eq 40]
+        jac = [
+            convolve(dI_dA,     G_norm, mode='same'),
+            convolve(dI_dmu,    G_norm, mode='same'),
+            convolve(dI_ds_int, G_norm, mode='same'),
+            convolve(dI_dg_int, G_norm, mode='same'),
+            convolve(I_nu,      dG_ds_inst, mode='same') # Kernel derivative
+        ]
+        
+        # 5. Interpolate back to data grid and normalize by error [7]
+        jac_matrix = np.array([np.interp(x, x_fine, j) for j in jac])
+        # return np.transpose(jac_)
+        # jac_matrix = np.stack(jac_, axis=1)
+        # print(np.shape(jac_), np.shape(jac_matrix))
+        # l2_norms = np.sqrt(np.sum(jac_matrix**2, axis=-1))
+        # print(jac_matrix.shape)
+        # print(l2_norms.shape)
+        # print(np.max(jac_matrix,axis=1))
+        # print(l2_norms)
+        # avoid division by zero
+        # l2_norms[l2_norms == 0] = 1.0
+        jac_normalized = - jac_matrix.T / yerr [:, np.newaxis] 
+
+        return jac_normalized
+    
+def get_Hn(n, u):
+    """
+    Returns the n-th Taylor series coefficient for the Voigt function H(a, u).
+    Based on formulas in Equations (21) of the Webb & Lee paper.
+    """
+    exp_u2 = np.exp(-u**2)
+    sqrt_pi = np.sqrt(np.pi)
+    D = dawsn(u)
+    
+    if n == 0:
+        return exp_u2
+    elif n == 1:
+        return -(2.0 / sqrt_pi) * (1.0 - 2.0 * u * D)
+    elif n == 2:
+        return (1.0 - 2.0 * u**2) * exp_u2
+    elif n == 3:
+        term = 1.0 - (u**2 / 3.0) - u * (1.0 - (2.0 * u**2 / 3.0)) * D
+        return -(4.0 / sqrt_pi) * term
+    else:
+        # Higher order terms (n > 3) are generally negligible [1]
+        return 0.0
+
+def get_Hnu(n, u):
+    """
+    Returns the derivative of the n-th Taylor coefficient with respect to u.
+    Based on formulas in Equations (30) of the Webb & Lee paper.
+    """
+    exp_u2 = np.exp(-u**2)
+    sqrt_pi = np.sqrt(np.pi)
+    D = dawsn(u)
+    
+    if n == 0:
+        return -2.0 * u * exp_u2
+    elif n == 1:
+        return (4.0 / sqrt_pi) * (u + (1.0 - 2.0 * u**2) * D)
+    elif n == 2:
+        return (-6.0 * u + 4.0 * u**3) * exp_u2
+    elif n == 3:
+        term_poly = 5.0 * u - 2.0 * u**3
+        term_dawson = (3.0 - 12.0 * u**2 + 4.0 * u**4) * D
+        return (4.0 / (3.0 * sqrt_pi)) * (term_poly + term_dawson)
+    else:
+        return 0.0
     
 def get_binlimits(xarray,center,scale):
     if scale[:3]=='pix':

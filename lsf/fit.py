@@ -16,6 +16,8 @@ import matplotlib.pyplot as plt
 import logging
 from scipy.optimize import leastsq, least_squares
 import scipy.interpolate as interpolate
+from scipy.interpolate import splrep, splev
+
 from matplotlib import ticker
 
 from typing import Tuple, Optional, Any, Callable
@@ -24,10 +26,13 @@ from typing import Tuple, Optional, Any, Callable
 def residuals(pars,lsf_loc_x,lsf_loc_y,sct_loc_x,sct_loc_y,
               x,scale,weight=False,obs=None,obs_err=None):
     amp, cen, wid, m, y0 = _unpack_pars(pars)
-    
-    model_data    = lsf_model(lsf_loc_x,lsf_loc_y,pars,x,scale) + \
+    splr_lsf      = interpolate.splrep(lsf_loc_x , lsf_loc_y / np.max(lsf_loc_y)) 
+    model_data    = lsf_model(splr_lsf, pars, x, scale) + \
                     m * (x-cen) + y0 
-    model_scatter = sct_model(sct_loc_x,sct_loc_y,pars,x,scale)
+                    
+    
+    splr_sct  = interpolate.splrep(sct_loc_x, sct_loc_y)
+    model_scatter = sct_model(splr_sct, pars,x,scale)
     if not weight:
         within  = within_limits(x,cen,scale)
         weights = np.zeros_like(x)
@@ -45,7 +50,7 @@ def residuals(pars,lsf_loc_x,lsf_loc_y,sct_loc_x,sct_loc_y,
         return resid.astype(np.float64)
     else:
         return model_data
-def residuals2(pars,lsf_loc_x,lsf_loc_y,sct_loc_x,sct_loc_y,
+def residuals2(pars,splr_lsf,
               x,scale,weight=False,obs=None,obs_err=None):
     # amp, cen, wid, m, y0 = _unpack_pars(pars)
     cen = _unpack_pars(pars)[1]
@@ -59,7 +64,8 @@ def residuals2(pars,lsf_loc_x,lsf_loc_y,sct_loc_x,sct_loc_y,
         weights_lsf[within] = 1.
     else:
         weights_lsf  = assign_weights(x,cen,scale)
-    model_lsf    = lsf_model(lsf_loc_x,lsf_loc_y,pars,x,scale)# * weights_lsf
+    # splr_lsf   = interpolate.splrep(lsf_loc_x , lsf_loc_y / np.max(lsf_loc_y)) 
+    model_lsf  = lsf_model(splr_lsf, pars, x, scale)# * weights_lsf
     # model_scatter = sct_model(sct_loc_x,sct_loc_y,pars,x,scale)
     # 
     
@@ -123,6 +129,7 @@ def line_old(x1l,flx1l,err1l,bary,LSF1d,scale,weight=True,interpolate=True,
                                                   x1l,scale,weight,
                                                   flx1l,err1l),
                                             ftol=1e-12,
+                                            Dfun=jacobian_analytical,
                                             full_output=True)
         else:
             bounds = np.array([(0.8*guess_amp,1.2*guess_amp),
@@ -133,6 +140,7 @@ def line_old(x1l,flx1l,err1l,bary,LSF1d,scale,weight=True,interpolate=True,
             print(bounds)
             result = least_squares(residuals, x0=p0,
                                     bounds = bounds[:npars].T,
+                                    jac=jacobian_analytical,
                                     args=(lsf_loc_x,lsf_loc_y,
                                           sct_loc_x,sct_loc_y),
                                     )
@@ -331,7 +339,10 @@ def line(
     num_interp_points = 2 if interpolate else 1
     lsf_loc_x, lsf_loc_y = LSF1d_obj.interpolate_lsf(bary, num_interp_points)
     sct_loc_x, sct_loc_y = LSF1d_obj.interpolate_scatter(bary, num_interp_points) # sct_loc currently unused by residuals2
-
+    
+    splr_lsf  = splrep(lsf_loc_x , lsf_loc_y / np.max(lsf_loc_y)) 
+    
+    
     # --- 2. Initial Parameter Guessing ---
     p0_obj = _prepare_pars(npars, method, x1l, flx1l) # Returns tuple for scipy, Parameters for lmfit
 
@@ -352,15 +363,15 @@ def line(
         p0_scipy_tuple = p0_obj # _prepare_pars already returns tuple for scipy
 
         args_for_residuals = (
-            lsf_loc_x, lsf_loc_y,
-            sct_loc_x, sct_loc_y, # sct_loc currently unused by residuals2
+            splr_lsf,
+            # sct_loc_x, sct_loc_y, # sct_loc currently unused by residuals2
             x1l, scale, weight,
             flx1l, err1l
         )
-
         if not bounded:
             popt, pcov, infodict, errmsg, ier = leastsq(
                 residuals2, x0=p0_scipy_tuple, args=args_for_residuals,
+                Dfun=jacobian_analytical,
                 ftol=ftol_scipy, full_output=True
             )
             success = ier in [1, 2, 3, 4]
@@ -410,19 +421,16 @@ def line(
             
             # Transpose for least_squares format
             final_scipy_bounds_transposed = np.array(scipy_bounds)
-            print("Attempting to fit")
+            # print("Attempting to fit")
             
             try:
                 
                 result = least_squares(
                     residuals2, x0=p0_scipy_tuple,
                     bounds=final_scipy_bounds_transposed,
-                    args=args_for_residuals, # residuals2 expects (pars, ..., x, scale, weight, obs, obs_err)
-                                                # least_squares passes (pars, *args)
-                                                # so args should be (lsf_x, lsf_y, sct_x, sct_y, x, scale, weight, obs, obs_err)
-                                                # Wait, the original code was:
-                                                # args=(lsf_loc_x,lsf_loc_y,sct_loc_x,sct_loc_y), THIS IS WRONG for residuals2
-                                                # It needs all the args.
+                    jac=jacobian_analytical,
+                    x_scale='jac',
+                    args=args_for_residuals, 
                     # kwargs={'obs': flx1l, 'obs_err': err1l}, # Pass obs and obs_err via kwargs for least_squares
                     ftol=ftol_scipy,
                 )
@@ -450,7 +458,7 @@ def line(
             except Exception as e:
                 if verbose: print(f"Error during SciPy (least_squares) bounded fit: {e}")
                 success = False
-            print("Fit success = ", success)
+            # print("Fit success = ", success)
         # Post-process covariance for both scipy methods if successful
         if success and covariance_matrix is not None:
             dof_fit = max(1, len(x1l) - len(pars_arr)) # Ensure dof > 0
@@ -482,8 +490,9 @@ def line(
 
         p0_lmfit_params = p0_obj # _prepare_pars returns Parameters object for lmfit
         minimize_kws = dict(
-            lsf_loc_x=lsf_loc_x, lsf_loc_y=lsf_loc_y,
-            sct_loc_x=sct_loc_x, sct_loc_y=sct_loc_y, # sct_loc currently unused
+            splr_lsf=splr_lsf,
+            # lsf_loc_x=lsf_loc_x, lsf_loc_y=lsf_loc_y,
+            # sct_loc_x=sct_loc_x, sct_loc_y=sct_loc_y, # sct_loc currently unused
             x=x1l, scale=scale, weight=weight,
             obs=flx1l, obs_err=err1l
         )
@@ -494,10 +503,15 @@ def line(
                 residuals2, params=p0_lmfit_params, kws=minimize_kws, **current_lmfit_options
             )
             success = result.success
+            
             if success:
                 pars_arr = np.array(list(result.params.valuesdict().values())) # Ensure order
-                errors_arr = np.array([result.params[pname].stderr for pname in result.params if result.params[pname].stderr is not None] 
-                                     + [np.nan]*(npars - len([p for p in result.params if result.params[pname].stderr is not None])))
+                # errors_arr = np.array([result.params[pname].stderr for pname in result.params if result.params[pname].stderr is not None] 
+                #                      + [np.nan]*(npars - len([p for p in result.params if result.params[pname].stderr is not None])))
+                errors_arr = np.array(
+                        [result.params[pname].stderr for pname in result.params if result.params[pname].stderr is not None] + 
+                        [np.nan] * (npars - len([pname for pname in result.params if result.params[pname].stderr is not None]))
+                    )
                 if len(errors_arr) != npars : errors_arr = np.full(npars, np.nan) # Fallback
                 
                 cost = result.chisqr if result.chisqr is not None else np.sum(result.residual**2)
@@ -525,9 +539,10 @@ def line(
     # Reconstruct the model using the fitted parameters (or NaNs if failed)
     # Important: Pass weight=False (or ensure residuals2 handles it) if model shouldn't be weighted
     # As analyzed, residuals2 does not apply weights_lsf to model_data when obs is None, so this is okay.
-    print(pars_arr)
+    # print(pars_arr)
     model_array = residuals2(
-        pars_arr, lsf_loc_x, lsf_loc_y, sct_loc_x, sct_loc_y,
+        pars_arr,splr_lsf ,
+        #lsf_loc_x, lsf_loc_y, sct_loc_x, sct_loc_y,
         x=x1l, scale=scale, weight=weight, # Pass original weight for consistency in how cen might be used
         obs=None, obs_err=None
     )
@@ -591,7 +606,7 @@ def line(
             except Exception as e:
                 if verbose: print(f"Error during plotting: {e}")
                 if 'fig_object' in locals() and fig_object is not None: # If fig was created but error later
-                     output_tuple += (fig_object,) # Still add it if it exists
+                     output_tuple += (fig_object,) # Still add it, if it exists
                 else:
                      output_tuple += (None,) # Add None if fig creation failed entirely
         else:
@@ -600,6 +615,46 @@ def line(
 
 
     return output_tuple
+
+def jacobian_analytical(pars,splr_lsf,
+              x,scale,weight=False,obs=None,obs_err=None):
+    amp, cen, wid = _unpack_pars(pars)[:3]
+    wid = np.abs(wid)
+    # 1. Transform x-coordinates to the eIP frame (delta_x)
+    if scale[:3] == 'pix':
+        dx_vals = x - cen
+        dt_dcen = -1.0
+    elif scale[:3] == 'vel':
+        dx_vals = (x - cen) / cen * 299792.458
+        dt_dcen = -299792.458 * x / (cen**2)
+
+    # 2. Evaluate the eIP (psi) and its derivative (psi_prime)
+    # Using the pre-calculated spline representation
+    psi       = interpolate.splev(dx_vals * wid, splr_lsf, der=0)
+    psi_prime = interpolate.splev(dx_vals * wid, splr_lsf, der=1)
+    
+    # 3. Model derivatives (dModel/dp) [12, 13]
+    dM_dA   = psi
+    # Applying Chain Rule: dM/dcen = A * d_psi/dx * dx/dcen
+    dM_dcen = amp * psi_prime * (1.0 / wid) * dt_dcen
+    # Applying Chain Rule: dM/dwid = A * d_psi/dx * dx/dwid
+    dM_dwid = amp * psi_prime * (-dx_vals / (wid**2))
+    
+    # 4. Handle Weighting [14, 15]
+    # Use the same weighting logic as residuals2 to ensure consistency
+    if weight:
+        w_array = assign_weights(x, cen, scale)
+    else:
+        # 'within_limits' logic from HARPS source [5, 16]
+        w_array = np.zeros_like(x)
+        w_array[within_limits(x, cen, scale)] = 1.0
+
+    # 5. Stack and return residual derivatives: - (1/sigma) * dModel/dp [17, 18]
+    # The negative sign is essential because residuals = (Obs - Model) / Err
+    jac_matrix = np.stack([dM_dA, dM_dcen, dM_dwid], axis=1)
+    weighted_jac = jac_matrix * w_array[:, np.newaxis]
+    
+    return -weighted_jac / obs_err[:, np.newaxis]
 
 def get_chisq_dof(x1l,flx1l,err1l,model,pars,scale):
     if len(np.shape(model))>1:
@@ -747,8 +802,8 @@ def plot_fit(x1l,flx1l,err1l,model,pars,scale,is_gaussian=False,
     lsf_loc_x = kwargs.pop('lsf_loc_x',None)
     lsf_loc_y = kwargs.pop('lsf_loc_y',None)
     if lsf_loc_x is not None and lsf_loc_y is not None:
-        
-        ygrid = lsf_model(lsf_loc_x,lsf_loc_y,pars,xgrid,scale)
+        splr  = interpolate.splrep(lsf_loc_x , lsf_loc_y / np.max(lsf_loc_y)) 
+        ygrid = lsf_model(splr, pars, xgrid, scale)
         label = r'$\psi(\Delta x)$'
     if is_gaussian:
         pars = _unpack_pars(pars)
@@ -883,7 +938,7 @@ def _unpack_pars(pars):
             m  = vals[3]
             y0 = vals[4]
     return (amp,cen,wid,m,y0)[:npars]
-def lsf_model(lsf_loc_x,lsf_loc_y,pars,xarray,scale):
+def lsf_model(splr, pars, xarray, scale):
     """
     Returns the model of the data from the LSF and parameters provided. 
     Does not include the background.
@@ -893,20 +948,20 @@ def lsf_model(lsf_loc_x,lsf_loc_y,pars,xarray,scale):
     amp,cen,wid = _unpack_pars(pars)[:3]
     
     wid   = np.abs(wid)
-    x     = lsf_loc_x * wid
-    y     = lsf_loc_y / np.max(lsf_loc_y) 
+    # x     = lsf_loc_x * wid
+    # y     = lsf_loc_y / np.max(lsf_loc_y) 
     # print(pars)
-    splr  = interpolate.splrep(x,y) 
+    # splr  = interpolate.splrep(x,y) 
     
     if scale[:3]=='pix':
         x_test = xarray-cen
     elif scale[:3]=='vel':
         x_test = (xarray-cen)/cen*299792.458
     # model = amp * (m*x_test + y0 + interpolate.splev(x_test,splr))
-    model = amp * interpolate.splev(x_test,splr) 
+    model = amp * interpolate.splev(x_test / wid,splr) 
     return model
 
-def sct_model(sct_loc_x,sct_loc_y,pars,xarray,scale):
+def sct_model(splr, pars,xarray,scale):
     """
     Returns the model of the data from the LSF and parameters provided. 
     Does not include the background.
@@ -915,15 +970,13 @@ def sct_model(sct_loc_x,sct_loc_y,pars,xarray,scale):
     """
     amp,cen,wid,m,y0 = _unpack_pars(pars)
     wid   = np.abs(wid)
-    x     = sct_loc_x * wid
-    y     = sct_loc_y 
-    splr  = interpolate.splrep(x,y)
+    
     
     if scale[:3]=='pix':
         x_test = xarray-cen
     elif scale[:3]=='vel':
         x_test = (xarray-cen)/cen*299792.458
-    model = interpolate.splev(x_test,splr)
+    model = interpolate.splev(x_test / wid, splr)
     return np.exp(model/2.)
 
 def within_limits(xarray,center,scale):

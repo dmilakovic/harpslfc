@@ -26,6 +26,8 @@ def read_lsf_from_fits(filepath,extname,version):
             if hasdata:
                 lsf2d = hdul[extname,version].read()
             else:
+                print(f'Did not find the extension {extname}, version {version}. The file contains:')
+                print(hdul)
                 raise Exception
     else:
         raise Exception

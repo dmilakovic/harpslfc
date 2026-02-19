@@ -34,6 +34,8 @@ import scipy.stats as stats
 quiet = hs.quiet
 # hs.setup_logging()
 
+frequency_error = 2e4 # Hz
+
 def _make_extname(order):
     return "ORDER{order:2d}".format(order=order)
 
@@ -82,6 +84,7 @@ def arange_modes_from_array(center1d,wave1d,reprate,anchor):
 
     # total number of lines
     nlines = len(center1d)
+    assert nlines>=2, f"The number of lines must be >2. Instead, it is {nlines}."
     # central line
     ref_index = nlines//2
     ref_pixel = center1d[ref_index]
@@ -372,7 +375,7 @@ def detect1d_from_spec(spec,order,fittype=['gauss'],
         cerror  = linelist_temp[f'{fittype_}_pix_err'][:,1]
         freq    = linelist_temp['freq']
         wave    = lfcfunc.freq_to_lambda(freq)
-        werror  = 1e10*(c/freq**2) * 2e4
+        werror  = 1e10*(c/freq**2) * frequency_error
         polytype = 'ordinary'
         npix    = spec.npix
         coeffs_lfc = hfit.dispersion1d(centers,wave,cerror,werror,version,polytype,
@@ -428,9 +431,8 @@ def detect2d_from_spec(spec,order=None,fittype=['gauss'],
                        return_thar_linelist=False,*args,**kwargs):
     
     
-    
+    assert wavereference in ['LFC', 'ThAr'], f"Unknown wavelength reference. [LFC or ThAr] but {wavereference} provided."
     orders = spec.prepare_orders(order)
-    
     flx = spec['flux']
     bkg2d = spec['background']
     line_positions = spec.line_positions
@@ -439,10 +441,8 @@ def detect2d_from_spec(spec,order=None,fittype=['gauss'],
     print(fittype, wavereference)
     
     wav_thar = spec.wavereference
-    if wavereference=='ThAr':
-        wav = wav_thar
-        pass
-    elif wavereference=='LFC':
+    wav = wav_thar
+    if wavereference=='LFC':
         # detect lines in ThAr
         linelist_thar = detect2d_from_spec(spec,order,fittype=['gauss'],
                                            xscale=xscale,
@@ -456,13 +456,11 @@ def detect2d_from_spec(spec,order=None,fittype=['gauss'],
         # produce a wavelength calibration from the linelist produced 
         import harps.wavesol as ws
         wav_lfc = ws.polynomial(linelist_thar,version=version,fittype='gauss',
-                               npix=spec.npix,nord=None,
+                               npix=spec.npix,nord=spec.nbo,
                                full_output=False,*args,**kwargs)
         
         # and use that calibration
         wav = wav_lfc
-    
-    
     wav2d, flx2d, err2d = datafunc.prepare_data2d(wav, flx, bkg2d,
                                                   redisperse=redisperse,
                                                   subbkg=hs.subbkg,
@@ -500,6 +498,11 @@ def detect2d_from_spec(spec,order=None,fittype=['gauss'],
         
         linelist1d['order']=od
         linelist1d['optord']=spec.optical_orders[od]
+        if spec.instrument == 'ESPRESSO':
+            if od%2 == 0:
+                linelist1d['slice'] = 1
+            else:
+                linelist1d['slice'] = 2
         linelist2d.append(linelist1d)
         progress_bar.update(i/(len(orders)-1),f'Linelist, {wavereference}, {od}/{max(orders)}')
     linelist2d = np.hstack(linelist2d)
@@ -886,7 +889,7 @@ def model(spec,fittype,line_model=None,lsf=None,fibre=None,nobackground=False,
     
     lsf must be an instance of LSF class (see harps.lsf)
     """
-    line_model   = line_model if line_model is not None else hfit.default_line
+    line_model   = line_model if line_model is not None else hfit.default_line_class
     linelist     = spec['linelist']
     lineclass    = getattr(emline,line_model)
     numlines     = len(linelist)
@@ -910,7 +913,10 @@ def model(spec,fittype,line_model=None,lsf=None,fibre=None,nobackground=False,
         pars  = linelist[i][ftype]
         
         if fittype == 'gauss':
-            pix   = np.arange(pixl-1,pixr+1)
+            if line_model == "SimpleGaussian":
+                pix = np.arange(pixl, pixr)
+            elif line_model == "SingleGaussian":
+                pix   = np.arange(pixl-1,pixr+1)
             line  = lineclass()
             model2d[order,pixl:pixr] = line.evaluate(pars,pix)
         elif fittype == 'lsf':

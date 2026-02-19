@@ -17,6 +17,7 @@ from fitsio import FITS
 import warnings
 import itertools
 import traceback
+import time
 from matplotlib.patches import Ellipse
 import matplotlib.transforms as transforms
 import matplotlib.gridspec as gridspec # Import GridSpec
@@ -917,10 +918,10 @@ if __name__ == "__main__":
     hard_flux_cut = 320 if detector == 'red' else 420
     
     # --- Plotting Directory ---
-    plot_dir = base_dir / 'plots'  # Define output directory
+    plot_dir = Path('/Users/dmilakov/projects/spectroperf/dataprod/plots/') / time.strftime('%Y-%m-%dT%H-%M-%S')  # Define output directory
     plot_dir.mkdir(parents=True, exist_ok=True) # Create directory if it doesn't exist
     print(f"Plots will be saved to: {plot_dir.resolve()}")
-    save_plots_to_file = False
+    save_plots_to_file = True
     
     # --- Plotting Control ---
     # Set this to True to generate plots for the selected segment(s)
@@ -943,7 +944,7 @@ if __name__ == "__main__":
 
     # --- Segmentation & Selection ---
     NUM_SEGMENTS = 16   # <<< Number of segments to divide the order into
-    TARGET_ORDER_NUMBER = 1
+    TARGET_ORDER_NUMBER = 4
     TARGET_IMAGE_TYPE = 'A'
     # Set to a specific segment index (0 to NUM_SEGMENTS-1) to process only one,
     # or set to None to process and analyze all segments.
@@ -1208,6 +1209,8 @@ if __name__ == "__main__":
              # Construct filenames for analysis plots (always construct path objects)
              defocus_plot_path = comparison_dir / f"O{TARGET_ORDER_NUMBER}_{TARGET_IMAGE_TYPE}_analysis_defocus_vs_segment.pdf"
              astig_plot_path = comparison_dir / f"O{TARGET_ORDER_NUMBER}_{TARGET_IMAGE_TYPE}_analysis_astigmatism_vs_segment.pdf"
+             astig2_plot_path = comparison_dir / f"O{TARGET_ORDER_NUMBER}_{TARGET_IMAGE_TYPE}_analysis_secondary_astigmatism_vs_segment.pdf"
+             primary_spherical_plot_path = comparison_dir / f"O{TARGET_ORDER_NUMBER}_{TARGET_IMAGE_TYPE}_analysis_primary_spherical_vs_segment.pdf"
              coma_plot_path = comparison_dir / f"O{TARGET_ORDER_NUMBER}_{TARGET_IMAGE_TYPE}_analysis_coma_vs_segment.pdf"
              rmse_diff_plot_path = comparison_dir / f"O{TARGET_ORDER_NUMBER}_{TARGET_IMAGE_TYPE}_analysis_rmse_diff_vs_segment.pdf"
              cosine_sim_plot_path = comparison_dir / f"O{TARGET_ORDER_NUMBER}_{TARGET_IMAGE_TYPE}_analysis_cosine_sim_vs_segment.pdf"
@@ -1246,6 +1249,20 @@ if __name__ == "__main__":
                                                 title=f"Coma Z(3,1) vs Segment (Order {TARGET_ORDER_NUMBER}{TARGET_IMAGE_TYPE})",
                                                 filename=fname_coma)
                  except Exception as e: print(f"ERROR generating/saving coma plot: {e}")
+                 
+                 fname_astig2 = astig2_plot_path if save_plots_to_file else None
+                 try:
+                     plot_coefficient_vs_segment(all_segment_results, zernike_indices, n=4, m=2,
+                                                title=f"Secondary stigmatism Z(4,2) vs Segment (Order {TARGET_ORDER_NUMBER}{TARGET_IMAGE_TYPE})",
+                                                filename=fname_astig2)
+                 except Exception as e: print(f"ERROR generating/saving secondary astigmatism plot: {e}")
+                 
+                 fname_primary_spherical = primary_spherical_plot_path if save_plots_to_file else None
+                 try:
+                     plot_coefficient_vs_segment(all_segment_results, zernike_indices, n=4, m=0,
+                                                title=f"Primary spherical Z(4,0) vs Segment (Order {TARGET_ORDER_NUMBER}{TARGET_IMAGE_TYPE})",
+                                                filename=fname_primary_spherical)
+                 except Exception as e: print(f"ERROR generating/saving primary spherical plot: {e}")
 
                  fname_rmse = rmse_diff_plot_path if save_plots_to_file else None
                  try:

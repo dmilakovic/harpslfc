@@ -162,7 +162,7 @@ def stack_subbkg_divenv(fittype,linelists,flx3d_in,x3d_in,err3d_in,
     return pix3d,vel3d,flx3d,err3d,orders
 
 
-def stack_outpath(outpath,version,orders=None,subbkg=hs.subbkg,divenv=hs.subbkg,
+def stack_outpath(outpath,version,wavesol_version,orders=None,subbkg=hs.subbkg,divenv=hs.subbkg,
                    **kwargs):
     # wav2d = spec.wavereference
     # wav2d = spec['wavesol_gauss',701] # this should be changed to a new wsol every iteration
@@ -180,7 +180,7 @@ def stack_outpath(outpath,version,orders=None,subbkg=hs.subbkg,divenv=hs.subbkg,
         wav2d = wref
     else:
         wav2d = ws.comb_dispersion(linelist=llist, 
-                                   version=701, 
+                                   version=wavesol_version, 
                                    fittype=fittype,
                                    npix=npix, 
                                    nord=nord)

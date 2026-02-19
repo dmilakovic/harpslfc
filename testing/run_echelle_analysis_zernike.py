@@ -172,16 +172,25 @@ def run_post_analysis_plotting(results_fits_path, config):
         if 'MEDIAN_X' in results_table.dtype.names and np.any(np.isfinite(results_table['MEDIAN_X'])):
              print("Generating 2D detector coefficient maps...")
              value_type_2d = detector_map_config.get('value_type', 'coeff')
-             coeffs_to_plot = [(0, 0, "Tip"), 
+             coeffs_to_plot = [(0, 0, "Piston"), 
+                               (1, -1, "Horizontal tilt"), 
+                               (1, 1, "Vertical tilt"), 
                                (2, 0, "Defocus"), 
-                               (2, 2, "Astig_0"), 
-                               (2, -2, "Astig_45"),
-                               (3, 1, "Coma_V"), 
-                               (3,-1, "Coma_H"),
-                               (4, 0, "Central peak"),
-                               (4, 2, "Continuum_H42"),
-                               (6, 0, "Ring"),
-                               (6, 2, "Continuum_H62"),
+                               (2, 2, "Astigmatism vertical"), 
+                               (2, -2, "Astigmatism oblique"),
+                               (3, 1, "Primary Coma Horizontal"), 
+                               (3,-1, "Primary Coma Oblique"),
+                               (3, -3, "Trefoil vertical"), 
+                               (3, 3, "Trefoil oblique"), 
+                               (4, 0, "Primary spherical"),
+                               (4, -2, "Secondary astigmatism oblique"), 
+                               (4, 2, "Secondary astigmatism vertical"),
+                               (4, -4, "Quadrafoil vertical"), 
+                               (4, 4, "Quadrafoil oblique"),
+                               (5, -1, "Secondary coma horizontal"), 
+                               (5, 1, "Secondary coma vertical"), 
+                               (6, 0, "Secondary spherical"),
+                               (6, 2, "Tertiary astigmatism oblique"),
                                ]
              for n, m, name in coeffs_to_plot:
                  fn_2d = detector_map_dir / f"{file_prefix}_map_{name}_Z{n}{m}.{plot_format}" if save_plots else None
@@ -265,7 +274,7 @@ if __name__ == "__main__":
             # Enable flags based on command line args
             'stamps': {'enable': args.plot_stamps},
             'zernike': {'enable': args.plot_zernike},
-            'spectrum': {'enable': args.plot_spectrum, 'spectrum_type': 'abs'}, # Default spectrum type
+            'spectrum': {'enable': args.plot_spectrum, 'spectrum_type': 'coeff'}, # Default spectrum type
             'comparison': {'enable': args.plot_comparison},
             'heatmap': {'enable': args.plot_heatmap, 'value_type': 'coeff'}, # Default heatmap type
             'detector_map': {'enable': args.plot_detector, 'value_type': 'coeff'} # Default detector map type

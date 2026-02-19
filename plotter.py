@@ -20,6 +20,8 @@ from matplotlib.colorbar import ColorbarBase
 import matplotlib.colors as colors
 # from matplotlib.colors import Normalize,LinearSegmentedColormap
 from matplotlib import ticker
+from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter
 #------------------------------------------------------------------------------
 
 #                                PLOTTER   
@@ -332,6 +334,7 @@ def sciformat(x,y,exp,dec):
 def ccd_from_linelist(linelist,desc,fittype='gauss',xscale='pix',mean=False,column=None,
                       label=None,yscale='wave',centre_estimate=None,
                       quantile=None, scale='linear',cmap='RdBu_r',
+                      function=None,
                       *args,**kwargs):
     centre_colname = f'{fittype}_{xscale}'
     if mean:
@@ -366,6 +369,9 @@ def ccd_from_linelist(linelist,desc,fittype='gauss',xscale='pix',mean=False,colu
             # c = 1 / (sigma * np.sqrt(2*np.pi))
             # print('Normalised amplitude')
             pass
+        if function is not None:
+            assert callable(function)==True, 'Function must be callable.' 
+            c = function(c)
     # if column is not None:
     #     c_hist = c#linelist[desc][:,column]
     # else:
@@ -391,10 +397,10 @@ def ccd_from_linelist(linelist,desc,fittype='gauss',xscale='pix',mean=False,colu
 #     finite_ = np.logical_and.reduce(arr)
 #     cut     = np.where(finite_)[0]
 
-def ccd(x,y,c,c_hist=None,label=None,yscale='wave',bins=20,figsize=(6,6),
-        centre_estimate=None,quantile=None,scale='linear',cmap=None,
-        supress_colorbar_label=False,print_colorbar_label_above=True,
-        cbar_label=None,
+def ccd(x,y,c,c_hist=None, label=None, yscale='wave', bins=20, figsize=(6,6),
+        centre_estimate=None, quantile=None, scale='linear', cmap=None,
+        supress_colorbar_label=False, print_colorbar_label_above=True,
+        cbar_label=None, plot_contours=False,
         *args,**kwargs):
     
       
@@ -541,7 +547,16 @@ def ccd(x,y,c,c_hist=None,label=None,yscale='wave',bins=20,figsize=(6,6),
                     ls='-' if val>=0 else (0,(1,1))
                     ax.axhline(val,ls=ls,c='k',lw=2.)
         plotter.major_ticks(0,'y',ticknum=3)
-    
+    if plot_contours:
+        # import matplotlib.tri as tri
+        # triang = tri.Triangulation(x, y)
+        Xi, Yi, Ci = smooth_contour(x, y, c,
+                grid_size=300,
+                smooth_sigma=2.0  
+            )
+        levels = np.quantile(c,quantile) if quantile is not None else 5
+        _ = ax_bot.contour(Xi, Yi, Ci, levels=levels, cmap='gray')
+        
     fig.align_ylabels()
     
 #    plotter.scinotate(0,'y',exp=3,dec=0)
@@ -557,6 +572,22 @@ def ccd(x,y,c,c_hist=None,label=None,yscale='wave',bins=20,figsize=(6,6),
     # plotter.major_ticks(2,'y',ticknum=5)
     
     return plotter
+
+def smooth_contour( x, y, c, grid_size=200, smooth_sigma=1.0, method='cubic'):
+    # Create grid
+    xi = np.linspace(x.min(), x.max(), grid_size)
+    yi = np.linspace(y.min(), y.max(), grid_size)
+    Xi, Yi = np.meshgrid(xi, yi)
+
+    # Interpolate
+    Ci = griddata((x, y), c, (Xi, Yi), method=method)
+
+    # Smooth (Gaussian filter)
+    Ci_smooth = gaussian_filter(Ci, sigma=smooth_sigma)
+
+    return Xi, Yi, Ci_smooth
+
+
 def get_label(desc,column=None):
     label = desc
     if desc is not None:
