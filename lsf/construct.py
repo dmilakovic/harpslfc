@@ -752,7 +752,7 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
         # 3. Launch tasks for every segment in the echelle orders [3, 8]
         futures = [
             model_1s_remote.remote(
-                item, item[9], item[10], # Unpack (od, pixl, pixr) from iterator [4]
+                item[0], item[1], item[2], # Unpack (od, pixl, pixr) from iterator [4]
                 x2d_ref, flx2d_ref, err2d_ref, 
                 numiter=iter_center,
                 metadata=metadata,
