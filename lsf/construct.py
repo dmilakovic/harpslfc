@@ -32,6 +32,7 @@ from functools import partial
 import time
 import ctypes
 import logging, sys, os, datetime
+from logging.handlers import QueueHandler, QueueListener
 
 
 
@@ -606,7 +607,7 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
         logger = logger.getChild('from_spectrum_2d')
     else:
         logger = logging.getLogger(__name__).getChild('from_spectrum_2d')
-    
+    logger.setLevel(logging.INFO)
     if force_version is None:
         version = hv.item_to_version(dict(iteration=iteration,
                                             model_scatter=model_scatter,
@@ -758,12 +759,8 @@ def from_outpath_2d(outpath,orders,iteration,scale='pixel',iter_center=5,
         logger = logger.getChild('from_spectrum_2d')
     else:
         logger = logging.getLogger(__name__).getChild('from_spectrum_2d')
-        
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)  # minimum level for this handler
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    
+    
     
     if force_version is None:
         version = hv.item_to_version(dict(iteration=iteration,
