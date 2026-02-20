@@ -764,7 +764,30 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
             ) 
             for item in iterator
         ]
-    
+        
+        work_len = len(futures)
+        time_start = time.time()
+        finished_count = 0
+        unready = futures
+        results_ordered = [None] * work_len
+        # Map the futures to their original iterator indices to preserve order
+        future_to_index = {f: i for i, f in enumerate(futures)}
+
+        while unready:
+            # Wait for at least one task to finish (timeout=1s to refresh time display)
+            ready, unready = ray.wait(unready, num_returns=1, timeout=1.0)
+            
+            # Update stats
+            finished_count = work_len - len(unready)
+            progress = finished_count / work_len
+            time_elapsed = time.time() - time_start
+            
+            progress_bar.update(
+                progress, 
+                name=f'Ray LSF Fitting {scale} {iteration}',
+                time=time_elapsed,
+                logger=None
+            )
         # 4. Asynchronous collection of results
         results = ray.get(futures)
         
