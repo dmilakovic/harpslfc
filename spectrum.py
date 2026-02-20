@@ -159,7 +159,7 @@ class Spectrum(object):
                 data   = self.__call__(ext,ver)
                 header = self.return_header(ext)
                 hdu.write(data=data,header=header,extname=ext,extver=ver)
-                status = " calculated."
+                status = " calculated and saved to file."
             finally:
                 self.log('__getitem__',20,mess+status)
         return data
@@ -2341,7 +2341,7 @@ def process(spec,settings_dict):
     def comb_specific(fittype):
         comb_items = ['coeff','wavesol','residuals','model']
         return ['{}_{}'.format(item,fittype) for item in comb_items]
-    logger    = logging.getLogger(__name__+'.single_file')
+    logger    = logging.getLogger(__name__+'.processing')
     versions  = np.atleast_1d(settings_dict['version'])
     # print('settings_dict=',settings_dict)
     speckwargs = _spec_kwargs(settings_dict) 

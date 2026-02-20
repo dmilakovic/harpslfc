@@ -133,29 +133,6 @@ class LSF2d(object):
         
         To be used with partial decorator
         """
-        # # condict = {}
-        # if isinstance(item,dict):
-        #     if len(item)==2: segm_sent=True
-        #     condict.update(item)
-        # else:
-        #     dict_sent=False
-        #     if isinstance(item,tuple):
-                
-        #         nitem = len(item) 
-        #         if nitem==2:
-        #             segm_sent=True
-        #             order,segm = item
-                    
-        #         elif nitem==1:
-        #             segm_sent=False
-        #             order = item[0]
-        #     else:
-        #         segm_sent=False
-        #         order=item
-        #     condict['order']=order
-        #     if segm_sent:
-        #         condict['segm']=segm
-        # return condict, segm_sent
         return _extract_item_(item)
     @property
     def values(self):

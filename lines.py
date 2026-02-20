@@ -894,7 +894,7 @@ def model(spec,fittype,line_model=None,lsf=None,fibre=None,nobackground=False,
     lineclass    = getattr(emline,line_model)
     numlines     = len(linelist)
     model2d      = np.zeros_like(spec.data)
-    bkg2d        = spec.get_background()
+    bkg2d        = spec['background']
     fibre        = fibre if fibre is not None else 'A'
     if fittype == 'lsf':
         if lsf is not None:
