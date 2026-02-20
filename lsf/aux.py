@@ -111,6 +111,16 @@ def stack_subbkg_divenv(fittype,linelists,flx3d_in,x3d_in,err3d_in,
             pixr     = line['pixr']
             # print(pixl,pixr)
             f_star = line[f'{ftpix}_integral']
+            
+            # guard angainst failed fits, where f_star is np.nan
+            if not np.isfinite(f_star) or f_star <= 0:
+                pix3d[od,pixl:pixr,exp] = np.nan
+                vel3d[od,pixl:pixr,exp] = np.nan
+                flx3d[od,pixl:pixr,exp] = np.nan
+                err3d[od,pixl:pixr,exp] = np.nan
+                continue
+            
+
             x_star = line[ftpix][1]
             wav1l = x3d_in[exp,od,pixl:pixr]
             vel1l = (wav1l - line[ftwav][1])/line[ftwav][1]*299792.458 #km/s
@@ -133,12 +143,16 @@ def stack_subbkg_divenv(fittype,linelists,flx3d_in,x3d_in,err3d_in,
             # C_flux_err = 0.
             
             data1l = data[exp,od,pixl:pixr]
-            data1l_var_tmp = (data_error[exp,od,pixl:pixr])**2
-            # data1l_var = laux.quotient_variance(data1l, data1l_var_tmp, 
-            #                                     f_star, np.sqrt(f_star))
             flx1l = data1l/f_star
             p = flx1l
+            
+            # data1l_var_tmp = (data_error[exp,od,pixl:pixr])**2
+            # data1l_var = laux.quotient_variance(data1l, data1l_var_tmp, 
+            #                                     f_star, np.sqrt(f_star))
+            
             data1l_var = p*(1-p)/f_star 
+            data1l_var = np.clip(data1l_var, 0, None)  # prevent negative variance
+            
             data1l_err = np.sqrt(data1l_var)
             
             
