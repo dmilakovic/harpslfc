@@ -541,64 +541,87 @@ def get_extrema1d(y_axis, x_axis = None, y_error = None, remove_false=False,
         
     return maxima,minima
 
-def get_extrema2d(y_axis, x_axis = None, y_error = None, remove_false=False,
-              sOrder=None, eOrder = None,
-            method='peakdetect_derivatives', plot=False,
-            logger=None):
-    '''
-    A more general function to detect minima and maxima in the data
+# def get_extrema2d(y_axis, x_axis=None, y_error = None,
+#                   sOrder = None, eOrder = None,
+#                   method='peakdetect_derivatives', plot=False,
+#                   logger=None):
     
-    Returns a list of minima or maxima 
+#         pkd.process_spectrum2d(y_axis,
+#                            sOrder=None,
+#                            x_axis_orig_input=None,
+#                            super_sample_factor=3,
+#                            snr_threshold = 3, 
+#                            window_len_method_options: dict = None,
+#                            deriv_method='coeff', first_deriv_zero_threshold_factor=0.03,
+#                            # Parameters for Sav-Gol filter
+#                            savgol_params: dict = None, 
+#                            # Consolidated parameters for the hybrid filter (rules + separate DBSCAN)
+#                            hybrid_filter_params: dict = None,
+#                            triplet_removal_params: dict = None,
+#                            y_refinement_on_candidates_params: dict = None,
+#                            plot_main_details=False,
+#                            plot_deriv_stage_details=True, # Plot for initial smoothing/derivatives
+#                            plot_filter_stage_details=True,  # Plot for rule-based filter diagnostics
+#                            verbose=False
+#                        ):
+# def get_extrema2d(y_axis, x_axis = None, y_error = None, #remove_false=False,
+#               sOrder=None, eOrder = None,
+#             method='peakdetect_derivatives', plot=False,
+#             logger=None):
+#     '''
+#     A more general function to detect minima and maxima in the data
     
-    '''
-    nbo,npix = np.shape(y_axis)
-    sOrder   = sOrder if sOrder is not None else 39
-    eOrder   = eOrder if eOrder is not None else nbo
-    orders  = np.arange(sOrder,eOrder)
-    nbo, npix = np.shape(y_axis)
-    if y_error is not None:
-        assert np.shape(y_error)==np.shape(y_axis), "y_error not same length as y_axis"
-        y_axis = y_axis / y_error
-    x_axis = x_axis if x_axis is not None else np.tile(np.arange(npix),(nbo,1))
+#     Returns a list of minima or maxima 
+    
+#     '''
+#     nbo,npix = np.shape(y_axis)
+#     sOrder   = sOrder if sOrder is not None else 39
+#     eOrder   = eOrder if eOrder is not None else nbo
+#     orders  = np.arange(sOrder,eOrder)
+#     # nbo, npix = np.shape(y_axis)
+#     if y_error is not None:
+#         assert np.shape(y_error)==np.shape(y_axis), "y_error not same length as y_axis"
+#         y_axis = y_axis / y_error
+#     x_axis = x_axis if x_axis is not None else np.tile(np.arange(npix),(nbo,1))
 
-    assert np.shape(y_axis) == np.shape(x_axis)
+#     assert np.shape(y_axis) == np.shape(x_axis)
     
-    maxima2d = {}
-    minima2d = {}
+#     maxima2d = {}
+#     minima2d = {}
     
-    for i,od in enumerate(orders):
-        if od<sOrder: continue
-        y_axis1d = y_axis[od]
-        x_axis1d = x_axis[od]
+#     for i,od in enumerate(orders):
+#         if od<sOrder: continue
+#         y_axis1d = y_axis[od]
+#         x_axis1d = x_axis[od]
         
-        # plot = True if od==40 else False
-        maxima1d, minima1d = [np.array(a) for a 
-                         in pkd.process_spectrum_for_lfc_lines(
-                                                       y_axis1d, 
-                                                       x_axis1d, 
-                                                       super_sample_factor=5,
-                                                       window_len_method='auto_robust',
-                                                       plot_main=plot)]
+#         # plot = True if od==40 else False
+#         maxima1d, minima1d = [np.array(a) for a 
+#                          in pkd.process_spectrum1d(
+#                                                        y_axis1d, 
+#                                                        x_axis1d, 
+#                                                        super_sample_factor=5,
+#                                                        window_len_method_options='auto_robust',
+#                                                        plot_main_details=plot)]
         
-        maxima1d = np.transpose(maxima1d)
-        minima1d = np.transpose(minima1d)
+#         maxima1d = np.transpose(maxima1d)
+#         minima1d = np.transpose(minima1d)
         
         
         
-        # if remove_false:
-        #     cut = remove_false_minima(x_axis1d, y_axis1d,
-        #                               minima1d[0], minima1d[1],
-        #                               rsd_limit=3, mindist=8, maxdist=20, 
-        #                               polyord=1)
-        #     minima1d = np.array([_[cut] for _ in minima1d])
-        #     # maxima = np.array([_[cut] for _ in maxima])
+#         # if remove_false:
+#         #     cut = remove_false_minima(x_axis1d, y_axis1d,
+#         #                               minima1d[0], minima1d[1],
+#         #                               rsd_limit=3, mindist=8, maxdist=20, 
+#         #                               polyord=1)
+#         #     minima1d = np.array([_[cut] for _ in minima1d])
+#         #     # maxima = np.array([_[cut] for _ in maxima])
 
-        maxima2d[od] = maxima1d
-        minima2d[od] = minima1d
-        progress_bar.update(i/(len(orders)-1),f'Extrema {od}/{eOrder-1}')
+#         maxima2d[od] = maxima1d
+#         minima2d[od] = minima1d
+#         progress_bar.update(i/(len(orders)-1),f'Extrema {od}/{eOrder-1}')
     
         
-    return maxima2d,minima2d
+#     return maxima2d,minima2d
 
 # =============================================================================
     

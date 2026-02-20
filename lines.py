@@ -103,241 +103,6 @@ def arange_modes_from_array(center1d,wave1d,reprate,anchor):
     modes    = shifted+ref_n
     return modes, ref_index
 
-# def arange_modes_by_closeness(spec,order):
-#     """
-#     Uses the positions of maxima to assign mode numbers to all lines in the 
-#     echelle order. 
-    
-#     Looks for the line that is 'closest' to the expected wavelength of a mode,
-#     and uses this line to set the scale for the entire order.
-#     """
-#     thar = spec.tharsol[order]
-#     # warn if ThAr solution does not exist for this order:
-#     if sum(thar)==0:
-#         raise UserWarning("ThAr WAVELENGTH SOLUTION DOES NOT EXIST")
-        
-    
-#      # LFC keywords
-#     reprate = spec.lfckeys['comb_reprate']
-#     anchor  = spec.lfckeys['comb_anchor']
-#     maxima,minima = get_maxmin1d(spec,order)
-#     # total number of lines
-#     nlines = len(maxima)
-#     # calculate frequencies of all lines from ThAr solution
-#     maxima_index     = maxima
-#     maxima_wave_thar = thar[maxima_index]
-#     maxima_freq_thar = c/maxima_wave_thar*1e10
-#     # closeness is defined as distance of the known LFC mode to the line 
-#     # detected on the CCD
-    
-#     decimal_n = ((maxima_freq_thar - (anchor))/reprate)
-#     integer_n = np.rint(decimal_n).astype(np.int16)
-#     closeness = np.abs( decimal_n - integer_n )
-#     # the line closest to the frequency of an LFC mode is the reference:
-#     ref_index = int(np.argmin(closeness))
-#     ref_pixel = int(maxima_index[ref_index])
-#     ref_n     = int(integer_n[ref_index])
-#     print(ref_index,'\t',nlines)
-#     ref_freq  = anchor + ref_n * reprate
-#     ref_wave  = c/ref_freq * 1e10
-#     # make a decreasing array of modes, where modes[ref_index]=ref_n:
-#     aranged  = np.arange(nlines)[::-1]
-#     shifted  = aranged - (nlines-ref_index-1)
-#     modes    = shifted+ref_n
-#     return modes, ref_index
-
-
-    
-    
-
-
-# def detect1d(spec,order,plot=False,fittype=['gauss'],wavescale=['pix','wav'],
-#              wavereference='ThAr',
-#              gauss_model='SimpleGaussian',subbkg=hs.subbkg,divenv=hs.divenv,
-#              lsf=None,lsf_method='gp',lsf_interpolate=True,velocity_step=None,
-#              logger=None,debug=False,*args,**kwargs):
-#     """
-#     Returns a list of all LFC lines and fit parameters in the specified order.
-#     """
-#     log               = logger or logging.getLogger(__name__)
-#     # LFC keywords
-#     reprate           = spec.lfckeys['comb_reprate']
-#     anchor            = spec.lfckeys['comb_anchor']
-#     if 'anchor_offset' in list(kwargs.keys()):
-#         offset = kwargs.pop('anchor_offset')
-#     else:
-#         offset  = 0
-#     window            = spec.lfckeys['window_size']
-    
-#     # Make sure fittype and wavescale can be indexed
-#     fittype   = np.atleast_1d(fittype)
-#     wavescale = np.atleast_1d(wavescale)
-    
-#     # Data
-#     # if wavereference=='ThAr':
-#         # wave1d = 
-    
-    
-#     if velocity_step is not None: # redisperse the data to a new wavelength grid
-#         wave1d,flux1d,err1d = spec.redisperse(velocity_step)
-#     else:
-#         flux = spec.flux[order]
-#         error = spec.error[order]
-#         envel = spec.envelope[order]
-#         backg = spec.background[order]
-#         wave1d = spec.wavereference[order]
-    
-#     data = laux.prepare_data(flux,error,envel,backg,
-#                                     subbkg=subbkg,divenv=divenv)
-#     flx_norm, err_norm, bkg_norm = data
-#     pn_weights        = spec.weights[order]
-#     background        = bkg_norm
-#     envelope          = spec.envelope[order]
-#     # Mode identification 
-#     maxima ,minima     = hf.detect_maxmin(flx_norm,None,*args,**kwargs)
-#     maxima_x, maxima_y = maxima
-#     minima_x, minima_y = minima
-#     nlines             = len(minima_x)-1
-#     if debug:
-#         log.info("Identified {} LFC lines in order {}".format(nlines,order))
-#     # Plot
-#     npix = spec.npix
-#     if plot:
-#         plt.figure()
-#         plt.plot(np.arange(npix),flx_norm)
-#         plt.vlines(minima_x,0,np.max(flx_norm),linestyles=':',
-#                    linewidths=0.4,colors='C1')
-        
-#     # New data container
-#     linelist          = container.linelist(nlines)
-#     linelist['order'] = order
-#     linelist['optord']= spec.optical_orders[order]
-#     for i in range(0,nlines,1):
-#         # mode edges
-#         # if i>0:
-#         #     lpix = int((maxima_x[i-1]+maxima_x[i])/2)
-#         # else:
-#         #     lpix = 0
-#         # if i<nlines-1:
-#         #     rpix = int((maxima_x[i]+maxima_x[i+1])/2)
-#         # else:
-#         #     rpix = spec.npix-1
-#         lpix, rpix = (int(minima_x[i]),int(minima_x[i+1]))
-#         # barycenter
-#         pix  = np.arange(lpix,rpix,1)
-#         flx  = flx_norm[lpix:rpix]
-#         if rpix-lpix<=4:
-#             print(i,lpix,rpix)
-#             continue
-#         # bary = centroid, flux weighted mean position
-#         bary = np.average(pix,weights=flx)
-#         # bmean = flux weighted mean of two brightest pixels
-#         s = np.argsort(flx)[-2:]
-#         bmean = np.average(pix[s],weights=flx[s])
-#         # skewness
-#         skew = stats.skew(flx,bias=False)
-#         # CCD segment assignment (pixel space)
-#         center  = maxima_x[i]
-#         local_seg = center//spec.segsize
-#         # photon noise
-#         sumw = np.sum(pn_weights[lpix:rpix])
-#         pn   = (c/np.sqrt(sumw))
-#         # signal to noise ratio
-#         err = err_norm[lpix:rpix]
-#         snr = np.sum(flx)/np.sum(err)
-#         # background
-#         bkg = background[lpix:rpix]
-        
-        
-#         linelist[i]['pixl']   = lpix
-#         linelist[i]['pixr']   = rpix
-#         linelist[i]['noise']  = pn
-#         linelist[i]['sumbkg'] = np.sum(bkg)
-#         linelist[i]['sumflx'] = np.sum(flx)
-#         linelist[i]['segm']   = local_seg
-#         linelist[i]['bary']   = bary
-#         linelist[i]['bmean']  = bmean
-#         linelist[i]['skew']   = skew
-#         linelist[i]['snr']    = snr
-#         linelist[i]['id']     = get_line_index(linelist[i])
-#     if debug:
-#         log.debug("Lines prepared for fitting using {}".format(fittype))
-#     # dictionary that contains functions for line profile fitting
-#     fitfunc = dict(gauss=fit_gauss1d)
-#     fitargs = dict(gauss=(gauss_model,))
-#     # print('all fine to here')
-#     if 'lsf' in fittype:   
-#         if lsf is not None:
-#             if isinstance(lsf,str):
-#                 lsf_full  = hlsf.from_file(lsf)
-#             elif isinstance(lsf,object):
-#                 lsf_full  = lsf
-#         else:
-#             lsf_full   = hlsf.read_lsf(spec.meta['fibre'],spec.datetime,lsf_method)
-#         # interpolation=kwargs.pop('interpolation',True)
-#         #print(interpolation)
-#         fitfunc['lsf']=fit_lsf1d
-#         fitargs['lsf']=(lsf_full,lsf_interpolate)
-        
-    
-#     for i,ft in enumerate(fittype):
-#         for j,ws in enumerate(wavescale):
-#             if ws == 'pix':
-#                 wave  = np.arange(spec.npix)
-#             elif ws=='wav':
-#                 wave  = spec.wavereference[order]
-#             linepars = fitfunc[ft](linelist,wave,flx_norm,err_norm,
-#                                    *fitargs[ft])
-#             linelist[f'{ft}_{ws}']          = linepars['pars']
-#             linelist[f'{ft}_{ws}_err']      = linepars['errs']
-#             linelist[f'{ft}_{ws}_chisq']    = linepars['chisq']
-#             linelist[f'{ft}_{ws}_chisqnu']  = linepars['chisqnu']
-#             linelist['success'][:,i*2+j*1]  = linepars['conv']
-#             linelist[f'{ft}_{ws}_integral'] = linepars['integral']
-            
-#     # print("Fitting of order {} completed ".format(order))
-#     # arange modes of lines in the order using ThAr coefficients in vacuum
-#     wave1d = spec.wavereference[order]
-#     center1d = linelist['gauss_pix'][:,1]
-#     modes,refline = arange_modes_from_array(center1d,wave1d,
-#                                             reprate,anchor+offset)
-#     for i in range(0,nlines,1):
-#          # mode and frequency of the line
-#         linelist[i]['mode'] = modes[i]
-#         linelist[i]['freq'] = anchor + modes[i]*reprate + offset
-# #        linelist[i]['anchor'] = anchor
-# #        linelist[i]['reprate'] = reprate
-#         if plot:
-#             if i==refline:
-#                 lw = 1; ls = '-'
-#             else:
-#                 lw = 0.5; ls = '--'
-#             plt.axvline(center1d[i],c='r',ls=ls,lw=lw) 
-#      # fit lines   
-#     return linelist
-
-
-
-# def detect(spec,order=None,logger=None,debug=False,*args,**kwargs):
-#     """
-#     Returns a list of all detected LFC lines in a numpy array defined as 
-#     linelist in harps.container
-#     """
-#     orders = spec.prepare_orders(order)
-#     output = []
-#     msg = 'failed'
-#     for od in orders:  
-#         try:
-#             output.append(detect1d_from_spec(spec,od,debug=debug,logger=logger,
-#                                    *args,**kwargs))
-#             msg = 'successful'
-#         except:
-#             pass
-#         if debug:
-#             log = logger or logging.getLogger(__name__)
-#             log.info('Order {} {}'.format(od,msg))
-#     lines2d = np.hstack(output)
-#     return lines2d
 
 def detect1d_from_spec(spec,order,fittype=['gauss'],
                        xscale=['pix','wav'],wavereference='LFC',
@@ -352,7 +117,12 @@ def detect1d_from_spec(spec,order,fittype=['gauss'],
     flx_od = spec['flux'][order]
     # bkg_od = spec['background'][order]
     wav_thar = spec['wavereference'][order]
-    minima1d = spec.extrema[1][order]
+    linepos  = spec['line_positions']
+    cut = np.where(linepos['order']==order)[0]
+    # minima1d = spec.extrema[1][order]
+    linepos1d = linepos[cut]
+    minima1d = np.union1d(linepos1d['pixl'],linepos1d['pixr'])
+    
     if wavereference=='ThAr':
         wav_od = wav_thar
         pass
@@ -435,12 +205,12 @@ def detect2d_from_spec(spec,order=None,fittype=['gauss'],
     orders = spec.prepare_orders(order)
     flx = spec['flux']
     bkg2d = spec['background']
-    line_positions = spec.line_positions
+    line_positions = spec['line_positions']
     # bkg=spec('background')
     
     print(fittype, wavereference)
     
-    wav_thar = spec.wavereference
+    wav_thar = spec['wavereference']
     wav = wav_thar
     if wavereference=='LFC':
         # detect lines in ThAr

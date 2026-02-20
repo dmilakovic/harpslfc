@@ -351,7 +351,7 @@ allowed_hdutypes = ['linelist','flux','background','error','weights','envelope',
                     'coeff_gauss','coeff_lsf','wavesol_gauss','wavesol_lsf',
                     'model_gauss','model_lsf','residuals_gauss','residuals_lsf',
                     'wavesol_2pt_lsf','wavesol_2pt_gauss','noise',
-                    'wavereference']
+                    'wavereference', 'extrema', 'line_positions']
 def new_fits(filepath,dirpath=None):
     # ------- Checks 
 #    assert hdutype in allowed_hdutypes, 'Unrecognized HDU type'

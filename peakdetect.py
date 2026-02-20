@@ -30,6 +30,7 @@ __all__ = [
         "plot_clustering_2d_results",
         "plot_feature_space_3d",
         "process_spectrum_for_lfc_lines",
+        "process_spectrum2d"
         ]
 
 

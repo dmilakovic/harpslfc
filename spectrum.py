@@ -232,6 +232,7 @@ class Spectrum(object):
         functions = {'linelist':lines.detect,
                      'line_positions':self.line_positions,
                      'extrema':self.get_extrema2d,
+                     'error':self.get_error2d,
                      'coeff_gauss':ws.get_wavecoeff_comb,
                      'coeff_lsf':ws.get_wavecoeff_comb,
                      'wavesol_gauss':ws.comb_dispersion,
@@ -245,7 +246,7 @@ class Spectrum(object):
                      'weights':self.get_weights2d,
                      'error':self.get_error2d,
                      #'background':self.background,
-                     'envelope':self.get_envelope,
+                     # 'envelope':self.get_envelope,
                      'wavereference':self.wavereference,
                      'noise':self.sigmav2d,
                      'flux':getattr,
@@ -262,13 +263,13 @@ class Spectrum(object):
                        'wavesol_2pt_gauss','wavesol_2pt_lsf']:
             # print(dataset,'funcargs=',funcargs(dataset))
             data = functions[dataset](*funcargs(dataset))
-        elif dataset in ['envelope','weights','noise']:
+        elif dataset in ['weights','noise','extrema','error']:
             data = functions[dataset]()
         elif dataset in ['linelist','model_gauss','model_lsf']:
             data = functions[dataset](self,*args,**kwargs)
-        elif dataset in ['flux','background','error','line_positions']:
-            data = getattr(self,dataset)
-        elif dataset in ['wavereference','flux_norm','err_norm']:
+        elif dataset in ['flux','background','envelope','line_positions',
+                         'wavereference','flux_norm','err_norm',
+                         ]:
             data = getattr(self,dataset)
         if write:
             with FITS(self._outpath,'rw') as hdu:
@@ -342,7 +343,6 @@ class Spectrum(object):
         header = self.return_header(extname)
         
         filepath = filepath if filepath is not None else self._outpath
-        print(filepath)
         with FITS(filepath,'rw') as hdu:
             if versent:
                 hdu.write(data=data,header=header,
@@ -447,6 +447,7 @@ class Spectrum(object):
         elif extension == 'weights':
             names = ['version']
         elif extension in ['flux','error','background','envelope','noise',
+                           'line_positions','extrema',
                            'wavereference','flux_norm','error_norm']:
             names = ['totflux']
         else:
@@ -517,132 +518,45 @@ class Spectrum(object):
         Returns the 2d error on flux values for the entire exposure. Caches the
         array.
         """
-        try:
-            error2d = self._cache['error2d']
-        except:
-            error2d = self.get_error2d()  
-            self._cache['error2d']=error2d
-        return error2d
+        return self['error']
+        # try:
+        #     error2d = self._cache['error2d']
+        # except:
+        #     # 1. Check if it's on disk before calculating
+        #     # This is faster than the 2D process
+        #     try:
+        #         return self.__getitem__('error')
+        #     except:
+        #         error2d = self.get_error2d()  
+        #         self.write(error2d, 'error')
+        #         self._cache['error2d']=error2d
+        # return error2d
+        
     def get_error2d(self):
         """
         Returns a 2d array with errors on flux values. Adds the error due to 
         background subtraction in quadrature to the photon counting error.
         """
         data2d  = np.abs(self.data)
-        bkg2d   = self.background
+        bkg2d   = self['background']
         error2d = np.sqrt(np.abs(data2d) + np.abs(bkg2d))
         return error2d
     
-    def get_error1d(self,order,*args):
-        """
-        Returns a 1d array with errors on flux values for this order. 
-        Adds the error due to background subtraction in quadrature to the 
-        photon counting error.
-        """
-        data1d  = np.abs(self.data[order])
-        bkg1d   = np.abs(background.get1d(self,order,*args))
-        error1d = np.sqrt(data1d + bkg1d)
-        return error1d
     
-    @property
-    def extrema(self):
-        """
-        Returns a dictionary containing extrema (maxima and minima) present in 
-        the LFC data. Caches the output.
-        """
-        try:
-            extrema2d = self._cache['extrema']
-        except:
-            extrema2d = self.get_extrema2d()  
-            self._cache['extrema']=extrema2d
-        return extrema2d
+    def get_linepos_env_bkg(self):
+        flux2d = self.flux
+        sOrder = self.sOrder
+        eOrder = self.eOrder
+        line_positions, env2d, bkg2d = background.get_linepos_env_bkg(flux2d,sOrder,plot=False,verbose=False)
+        # 3. Save ALL THREE to disk immediately to save time later
+        self.write(bkg2d, 'background')
+        self.write(env2d, 'envelope')
+        self.write(line_positions, 'line_positions')
+        self._cache['line_positions'] = line_positions
+        self._cache['envelope2d']=env2d
+        self._cache['background2d']=bkg2d
+        return line_positions, env2d, bkg2d
     
-    def get_extrema2d(self, *args, **kwargs):
-        """
-        Returns a dictionary containing extrema (maxima and minima) present in 
-        the LFC data..
-        """
-        sOrder = kwargs.pop('sOrder', self.sOrder)
-        eOrder = kwargs.pop('eOrder', None)
-        rf     = kwargs.pop('remove_false',False)
-        extrema2d = specfunc.get_extrema2d(self.flux, x_axis=None, y_error=None, 
-                                       remove_false=rf,
-                                       sOrder = sOrder, eOrder = eOrder,
-                                       method='peakdetect_derivatives', 
-                                       *args, **kwargs)
-        
-        return extrema2d
-    
-    def get_extrema1d(self,order,*args,**kwargs):
-        """
-        Returns a 1d array with errors on flux values for this order. 
-        Adds the error due to background subtraction in quadrature to the 
-        photon counting error.
-        """
-        y_axis = self.flux[order]
-        extrema1d = specfunc.get_extrema1d(y_axis, x_axis=None, y_error=None, 
-                                       remove_false=False,
-                                       method='peakdetect_derivatives', 
-                                       *args,**kwargs)
-        return extrema1d
-    
-    @property
-    def maxima(self):
-        
-        try:
-            target = self._cache['maxima']
-        except:
-            maxima2d, minima2d = self.extrema
-            dtype = np.dtype([('order',int),
-                              ('point',float,(2,))
-                              ])
-            
-            for label, dictionary in zip(['maxima','minima'],
-                                         [maxima2d,minima2d]):
-                extremum_list = []
-                for od,array_ in dictionary.items():
-                    # array = np.transpose(array_)
-                    array = array_
-                    
-                    extremum1d = np.zeros(len(array),dtype=dtype)
-                    extremum1d['order'] = od
-                    extremum1d['point'] = array
-                    extremum_list.append(extremum1d)
-                extremum = np.hstack(extremum_list)
-                self._cache[label] = extremum
-            
-            target = self._cache['maxima']
-                    
-        return target
-    
-    @property
-    def minima(self):
-        
-        try:
-            target = self._cache['minima']
-        except:
-            maxima2d, minima2d = self.extrema
-            dtype = np.dtype([('order',int),
-                              ('point',float,(2,))
-                              ])
-            
-            for label, dictionary in zip(['maxima','minima'],
-                                         [maxima2d,minima2d]):
-                extremum_list = []
-                for od,array_ in dictionary.items():
-                    # array = np.transpose(array_)
-                    array = array_
-                    
-                    extremum1d = np.zeros(len(array),dtype=dtype)
-                    extremum1d['order'] = od
-                    extremum1d['point'] = array
-                    extremum_list.append(extremum1d)
-                extremum = np.hstack(extremum_list)
-                self._cache[label] = extremum
-            
-            target = self._cache['minima']
-                    
-        return target
     
     @property
     def background(self):
@@ -651,15 +565,10 @@ class Spectrum(object):
         array.
         """
         try:
-            bkg2d = self._cache['background2d']
+            return self.__getitem__('background')
         except:
-            flux2d = self.flux
-            sOrder = self.sOrder
-            eOrder = self.eOrder
-            line_positions, env2d, bkg2d = background.get_linepos_env_bkg(flux2d,sOrder,plot=False,verbose=False)
-            self._cache['line_positions'] = line_positions
-            self._cache['envelope2d']=env2d
-            self._cache['background2d']=bkg2d
+            
+            line_positions, env2d, bkg2d = self.get_linepos_env_bkg()
         return bkg2d
     def get_background(self,*args):
         """
@@ -668,11 +577,7 @@ class Spectrum(object):
         return self.background
         # return background.get2d(self,*args)
     
-    def get_background1d(self,order,*args):
-        """
-        Returns the 1d background model for this order. 
-        """
-        return background.get1d(self,order,*args)
+    
     @property
     def envelope(self):
         """
@@ -680,15 +585,10 @@ class Spectrum(object):
         array.
         """
         try:
-            env2d = self._cache['envelope2d']
+            return self.__getitem__('background')
         except:
-            flux2d = self.flux
-            sOrder = self.sOrder
-            eOrder = self.eOrder
-            line_positions, env2d, bkg2d = background.get_linepos_env_bkg(flux2d,sOrder,plot=False,verbose=False)
-            self._cache['line_positions'] = line_positions
-            self._cache['envelope2d']=env2d
-            self._cache['background2d']=bkg2d
+            
+            line_positions, env2d, bkg2d = self.get_linepos_env_bkg()
         return env2d
     def get_envelope(self,*args):
         """
@@ -697,23 +597,14 @@ class Spectrum(object):
         return self.envelope
         # return background.getenv2d(self,*args)
     
-    def get_envelope1d(self,order,*args):
-        """
-        Returns the 1d background model for this order. 
-        """
-        return background.getenv1d(self,order,*args)
+    
     @property
     def line_positions(self):
         try:
-            line_positions = self._cache['line_positions']
+            return self.__getitem__('line_positions')
         except:
-            flux2d = self.flux
-            sOrder = self.sOrder
-            eOrder = self.eOrder
-            line_positions, env2d, bkg2d = background.get_linepos_env_bkg(flux2d,sOrder,plot=False,verbose=False)
-            self._cache['line_positions'] = line_positions
-            self._cache['envelope2d']=env2d
-            self._cache['background2d']=bkg2d
+            
+            line_positions, env2d, bkg2d = self.get_linepos_env_bkg()
         return line_positions
     @property
     def weights(self):
@@ -767,9 +658,9 @@ class Spectrum(object):
         Calculates the limiting velocity precison of all pixels in the order
         using ThAr wavelengths.
         """
-        data    = self.data[order]
-        thar    = self.wavereference[order]
-        err     = self.error[order]
+        data    = self['flux'][order]
+        thar    = self['wavereference'][order]
+        err     = self['error'][order]
         # weights for photon noise calculation
         # Equation 5 in Murphy et al. 2007, MNRAS 380 p839
         #pix2d   = np.vstack([np.arange(spec.npix) for o in range(spec.nbo)])
@@ -2285,30 +2176,6 @@ def process(spec,settings_dict):
         filepath (str): path to the e2ds file
     '''
     import logging
-    # def get_item(spec,item,version,**kwargs):
-    #     # print(item,version)
-    #     try:
-    #         itemdata = spec[item,version]
-    #         message  = 'saved'
-    #         #print("FILE {}, ext {} success".format(filepath,item))
-    #         del(itemdata)
-        
-    #     except:
-    #         message  = 'calculating (write=True)'
-    #         try:
-    #             itemdata = spec(item,version,write=True)
-    #             del(itemdata)
-    #         except:
-    #             message = 'FAILED'
-            
-    #     finally:
-    #         msg = "SPECTRUM {}".format(spec.filepath) +\
-    #                     " item {}".format(item.upper()) +\
-    #                     " version {}".format(version) +\
-    #                     " {}".format(message)
-    #         # print(msg)
-    #         logger.info(msg)
-    #     return
     def get_item(spec, item, version=None, **speckwargs):
         try:
             if version is None:

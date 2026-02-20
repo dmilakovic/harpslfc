@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 # import scipy.interpolate as interpolate
 import gc
 import multiprocessing
+multiprocessing.log_to_stderr()
 from functools import partial
 import time
 import ctypes
@@ -684,6 +685,7 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
     
         # construct the workers
         nproc = multiprocessing.cpu_count()
+        
         logger.info(f"Using {nproc} workers")
         workers = [Worker(str(name+1), partial_function,inq, outq,logger) 
                    for name in range(nproc)]
