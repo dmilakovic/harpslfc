@@ -673,19 +673,20 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
     
     
     
-    option=2
-    partial_function = partial(model_1s_,
-                                x2d=x2d,
-                                flx2d=flx2d,
-                                err2d=err2d,
-                                numiter=iter_center,
-                                filter=filter,
-                                model_scatter=model_scatter,
-                                plot=plot,
-                                save_plot=save_plot,
-                                metadata=metadata,
-                                logger=None
-                                )
+    option=3
+    if option!=3:
+        partial_function = partial(model_1s_,
+                                    x2d=x2d,
+                                    flx2d=flx2d,
+                                    err2d=err2d,
+                                    numiter=iter_center,
+                                    filter=filter,
+                                    model_scatter=model_scatter,
+                                    plot=plot,
+                                    save_plot=save_plot,
+                                    metadata=metadata,
+                                    logger=None
+                                    )
     if option==1:
         with multiprocessing.Pool() as pool:
             results = pool.starmap(partial_function,
@@ -736,7 +737,33 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
         while not outq.empty():
             results.append(outq.get())
     
+    elif option == 3:
+        logger.info('Starting distributed LSF fitting via Ray')
+        
+        # 1. Initialize Ray (Auto-detects laptop cores or HPC cluster)
+        if not ray.is_initialized():
+            ray.init()
+        
+        # 2. Put large spectral arrays into the Object Store [7]
+        x2d_ref = ray.put(x2d)
+        flx2d_ref = ray.put(flx2d)
+        err2d_ref = ray.put(err2d)
     
+        # 3. Launch tasks for every segment in the echelle orders [3, 8]
+        futures = [
+            model_1s_remote.remote(
+                item, item[9], item[10], # Unpack (od, pixl, pixr) from iterator [4]
+                x2d_ref, flx2d_ref, err2d_ref, 
+                numiter=iter_center,
+                metadata=metadata,
+                **kwargs
+            ) 
+            for item in iterator
+        ]
+    
+        # 4. Asynchronous collection of results
+        results = ray.get(futures)
+        
     for i,lsf1s_out in enumerate(results):
         if lsf1s_out[0] == None:
             msg = f"LSF1s model order {lsf1s_out[1]} segm {lsf1s_out[2]} failed"
@@ -901,7 +928,7 @@ def from_outpath_2d(outpath,orders,iteration,scale='pixel',iter_center=5,
         x2d_ref = ray.put(x2d)
         flx2d_ref = ray.put(flx2d)
         err2d_ref = ray.put(err2d)
-    
+        logger.info('Ray: spectral arrays placed into Object Store')
         # 3. Launch tasks for every segment in the echelle orders [3, 8]
         futures = [
             model_1s_remote.remote(
