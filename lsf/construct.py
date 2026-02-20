@@ -34,7 +34,17 @@ import ctypes
 import logging, sys, os, datetime
 from logging.handlers import QueueHandler, QueueListener
 
+import ray
 
+def initialize_ray(address=None):
+    if ray.is_initialized():
+        return
+    if address:
+        # Connects to an existing HPC cluster or remote head node
+        ray.init(address=address)
+    else:
+        # Starts a local cluster using all available cores on your laptop/remote machine
+        ray.init()
 
 
 def model_1si(i,seglims,x2d,flx2d,err2d,numiter=5,filter=None,model_scatter=False,
@@ -63,6 +73,12 @@ def model_1si(i,seglims,x2d,flx2d,err2d,numiter=5,filter=None,model_scatter=Fals
     else:
         out = None
     return i, out
+
+@ray.remote
+def model_1s_remote(od, pixl, pixr, x2d, flx2d, err2d, **kwargs):
+    # This is exactly the existing model_1s_ logic
+    # It will now run on whatever CPU Ray assigns it to
+    return model_1s_(od, pixl, pixr, x2d, flx2d, err2d, **kwargs)
 
 def model_1s_(od,pixl,pixr,x2d,flx2d,err2d,numiter=5,filter=None,model_scatter=False,
                     plot=False,save_plot=False,metadata=None,logger=None,
@@ -783,6 +799,8 @@ def from_outpath_2d(outpath,orders,iteration,scale='pixel',iter_center=5,
     flx2d = flx3d[:,:,0]
     err2d = err3d[:,:,0]
     
+    
+
     metadata = dict(
         scale=scale,
         # order=order,
@@ -809,19 +827,20 @@ def from_outpath_2d(outpath,orders,iteration,scale='pixel',iter_center=5,
     
     
     
-    option=2
-    partial_function = partial(model_1s_,
-                                x2d=x2d,
-                                flx2d=flx2d,
-                                err2d=err2d,
-                                numiter=iter_center,
-                                filter=filter,
-                                model_scatter=model_scatter,
-                                plot=plot,
-                                save_plot=save_plot,
-                                metadata=metadata,
-                                logger=None
-                                )
+    option=3
+    if option !=3:
+        partial_function = partial(model_1s_,
+                                    x2d=x2d,
+                                    flx2d=flx2d,
+                                    err2d=err2d,
+                                    numiter=iter_center,
+                                    filter=filter,
+                                    model_scatter=model_scatter,
+                                    plot=plot,
+                                    save_plot=save_plot,
+                                    metadata=metadata,
+                                    logger=None
+                                    )
     if option==1:
         with multiprocessing.Pool() as pool:
             results = pool.starmap(partial_function,
@@ -871,7 +890,33 @@ def from_outpath_2d(outpath,orders,iteration,scale='pixel',iter_center=5,
         while not outq.empty():
             results.append(outq.get())
     
+    elif option == 3:
+        logger.info('Starting distributed LSF fitting via Ray')
+        
+        # 1. Initialize Ray (Auto-detects laptop cores or HPC cluster)
+        if not ray.is_initialized():
+            ray.init()
     
+        # 2. Put large spectral arrays into the Object Store [7]
+        x2d_ref = ray.put(x2d)
+        flx2d_ref = ray.put(flx2d)
+        err2d_ref = ray.put(err2d)
+    
+        # 3. Launch tasks for every segment in the echelle orders [3, 8]
+        futures = [
+            model_1s_remote.remote(
+                item, item[9], item[10], # Unpack (od, pixl, pixr) from iterator [4]
+                x2d_ref, flx2d_ref, err2d_ref, 
+                numiter=iter_center,
+                metadata=metadata,
+                **kwargs
+            ) 
+            for item in iterator
+        ]
+    
+        # 4. Asynchronous collection of results
+        results = ray.get(futures)
+        
     for i,lsf1s_out in enumerate(results):
         if lsf1s_out[0] == None:
             msg = f"LSF1s model order {lsf1s_out[1]} segm {lsf1s_out[2]} failed"
