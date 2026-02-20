@@ -755,8 +755,12 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
                 item[0], item[1], item[2], # Unpack (od, pixl, pixr) from iterator [4]
                 x2d_ref, flx2d_ref, err2d_ref, 
                 numiter=iter_center,
+                filter=filter,
+                model_scatter=model_scatter,
+                plot=plot,
+                save_plot=save_plot,
                 metadata=metadata,
-                **kwargs
+                logger=None
             ) 
             for item in iterator
         ]
