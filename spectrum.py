@@ -230,8 +230,8 @@ class Spectrum(object):
         assert dataset in io.allowed_hdutypes, "Allowed: {}".format(io.allowed_hdutypes)
         # version = hf.item_to_version(version)
         functions = {'linelist':lines.detect,
-                     'line_positions':self.line_positions,
-                     'extrema':self.get_extrema2d,
+                      'line_positions':self.get_linepos_env_bkg,
+                     # 'extrema':self.get_extrema2d,
                      'error':self.get_error2d,
                      'coeff_gauss':ws.get_wavecoeff_comb,
                      'coeff_lsf':ws.get_wavecoeff_comb,
@@ -245,8 +245,8 @@ class Spectrum(object):
                      'wavesol_2pt_lsf':ws.twopoint,
                      'weights':self.get_weights2d,
                      'error':self.get_error2d,
-                     #'background':self.background,
-                     # 'envelope':self.get_envelope,
+                     'background':self.get_linepos_env_bkg,
+                     'envelope':self.get_linepos_env_bkg,
                      'wavereference':self.wavereference,
                      'noise':self.sigmav2d,
                      'flux':getattr,
@@ -267,10 +267,16 @@ class Spectrum(object):
             data = functions[dataset]()
         elif dataset in ['linelist','model_gauss','model_lsf']:
             data = functions[dataset](self,*args,**kwargs)
-        elif dataset in ['flux','background','envelope','line_positions',
-                         'wavereference','flux_norm','err_norm',
-                         ]:
+        elif dataset in ['flux','wavereference','flux_norm','err_norm']:
             data = getattr(self,dataset)
+        elif dataset in ['background','envelope','line_positions']:
+            linepos, envelope, background = functions[dataset]()
+            if dataset=='line_positions':
+                data = linepos
+            elif dataset=='envelope':
+                data = envelope
+            elif dataset=='background':
+                data = background
         if write:
             with FITS(self._outpath,'rw') as hdu:
                 header = self.return_header(dataset)
