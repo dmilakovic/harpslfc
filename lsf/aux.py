@@ -1111,7 +1111,7 @@ def solve_line(i,linelist,x2d,flx2d,err2d,LSF2d_nm,ftype='gauss',scale='pix',
     pars = "None"
     chisq = np.nan
     
-    if LSF1d is None or len(LSF1d) == 0 or np.all(np.isnan(LSF1d.values['mf_amp'])):
+    if LSF1d is None or len(LSF1d) == 0 or np.any(LSF1d.values['y']):
         logger.warning(f"Order {od}: No valid LSF models found. Skipping line {i}.")
         # Return a failed line result to stay consistent with the bulk_fit loop
         line[f'lsf_{scl}'] = np.nan
