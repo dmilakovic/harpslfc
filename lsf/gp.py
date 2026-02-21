@@ -132,9 +132,9 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     if not valid_results:
         raise RuntimeError("All hyperparameter optimization starts failed.")
     
-    print(valid_results)
-    print(type(valid_results))
-    best_params = min(valid_results, key=lambda x: x[5])
+    # take the minimum of the second output of run_lsf_optimization_task,
+    # which is the negative log likelihood
+    best_params = min(valid_results, key=lambda x: x[1]) 
     return best_params
 
 def generate_starting_guesses(X, Y, Y_err, n):
