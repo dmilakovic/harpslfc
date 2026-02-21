@@ -17,7 +17,7 @@ import gc
 from   scipy.optimize import curve_fit, brentq
 import scipy.interpolate as interpolate
 import logging
-
+import ray
 
 
 @jax.jit
@@ -35,6 +35,125 @@ def _check_arrays(*args):
     cut     = np.where(finite)[0]
     return cut
 
+
+def get_lsf_bounds(X, Y, Y_err):
+    """
+    Calculates boxed constraints for GP hyperparameter optimization 
+    based on the data and an initial Gaussian fit.
+    """
+
+    # Initial guess for the mean function (A, mu, sigma, offset)
+    p0 = (np.max(Y), 0, np.std(X), 0)
+    
+    # Perform a preliminary Gaussian fit to establish constraint center
+    # Logic follows gp.txt [3]
+    popt, pcov = curve_fit(hf.gauss4p, X, Y, sigma=Y_err, absolute_sigma=False, p0=p0)
+    perr = np.sqrt(np.diag(pcov))
+    
+    # The 'kappa' factor determines the width of the search space 
+    # around the initial fit. gp.txt uses 5 [1].
+    kappa = 5
+    
+    lower_bounds = dict(
+        mf_amp      = popt - kappa * perr,
+        mf_loc      = popt[4] - kappa * perr[4],
+        mf_log_sig  = np.log(popt[5] - kappa * perr[5]),
+        mf_const    = popt[6] - kappa * perr[6],
+        gp_log_amp  = -4., 
+        gp_log_scale = -1.,
+        log_var_add = -15.,
+    )
+    
+    upper_bounds = dict(
+        mf_amp      = popt + kappa * perr,
+        mf_loc      = popt[4] + kappa * perr[4],
+        mf_log_sig  = np.log(popt[5] + kappa * perr[5]),
+        mf_const    = popt[6] + kappa * perr[6],
+        gp_log_amp  = 4., 
+        gp_log_scale = 1.,
+        log_var_add = 1.5,
+    )
+    
+    return (lower_bounds, upper_bounds)
+
+@ray.remote
+def run_lsf_optimization_task(theta_start, X, Y, Y_err, scatter, bounds):
+    """
+    Ray Task: Performs a single L-BFGS-B optimization.
+    JAX JIT is utilized within the loss_LSF function.
+    """
+    # Import within task to ensure availability on remote workers
+    from harps.lsf.gp import loss_LSF 
+    
+    lbfgsb = jaxopt.ScipyBoundedMinimize(
+        fun=partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter),
+        method="l-bfgs-b"
+    )
+    
+    # Run the optimization
+    try:
+        solution = lbfgsb.run(theta_start, bounds=bounds)
+        # Return the params and the final loss value for comparison
+        return solution.params, solution.state.fun_val
+    except Exception as e:
+        return None, jnp.inf
+    
+def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
+    """
+    Coordinating function for multi-start GP training.
+    """
+    
+    # 1. Put data in Ray Object Store to prevent redundant copying
+    X_ref = ray.put(X)
+    Y_ref = ray.put(Y)
+    Y_err_ref = ray.put(Y_err)
+    
+    # 2. Generate a list of diverse starting guesses (modifying lengths/amps)
+    starts = generate_starting_guesses(X, Y, Y_err, num_starts)
+    bounds = get_lsf_bounds(X, Y, Y_err) # Use existing bounds logic [4]
+
+    # 3. Launch parallel optimization tasks
+    futures = [
+        run_lsf_optimization_task.remote(s, X_ref, Y_ref, Y_err_ref, scatter, bounds) 
+        for s in starts
+    ]
+    
+    # 4. Collect results and choose the one with the minimum negative log-likelihood
+    results = ray.get(futures)
+    
+    # Filter out failures
+    valid_results = [res for res in results if res is not None]
+    if not valid_results:
+        raise RuntimeError("All hyperparameter optimization starts failed.")
+        
+    best_params = min(valid_results, key=lambda x: x[5])
+    return best_params
+
+def generate_starting_guesses(X, Y, Y_err, n):
+    """
+    Generates variations of the initial hyperparameters to explore
+    different regions of the likelihood surface.
+    """
+    
+    # Get the standard initial guess from existing logic
+    base_theta = train_LSF_tinygp(X, Y, Y_err, return_only_init=True)
+    
+    guesses = []
+    # Seed 0 is always the base guess
+    guesses.append(base_theta)
+    
+    # Add variations for other starts
+    # We vary gp_log_scale (correlation length) and gp_log_amp
+    for i in range(1, n):
+        new_theta = base_theta.copy()
+        # Perturb length-scale log-space by +/- 0.5
+        new_theta['gp_log_scale'] += np.random.uniform(-0.5, 0.5)
+        # Perturb GP amplitude
+        new_theta['gp_log_amp'] += np.random.uniform(-1.0, 1.0)
+        guesses.append(new_theta)
+        
+    return guesses
+    
 def train_LSF_tinygp(X,Y,Y_err,scatter=None):
     '''
     Returns parameters which minimise the loss function defined below.

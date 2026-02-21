@@ -440,11 +440,15 @@ def construct_tinygp(x,y,y_err,plot=False,
         logger = logging.getLogger(__name__).getChild('construct_tinygp')
     # if kwargs['metadata']['segment']==10:
     #     print(X,kwargs['metadata'])
-    LSF_solution_nosct = lsfgp.train_LSF_tinygp(X,Y,Y_err)
+    # LSF_solution_nosct = lsfgp.train_LSF_tinygp(X,Y,Y_err)
+    LSF_solution_nosct = lsfgp.train_LSF_multistart_ray(X, Y, Y_err, num_starts=4)
     logger.info(f"Found solution without scatter")
     if model_scatter:
         scatter = lsfgp.train_scatter_tinygp(X,Y,Y_err,LSF_solution_nosct)
-        LSF_solution = lsfgp.train_LSF_tinygp(X,Y,Y_err,scatter=scatter)
+        # LSF_solution = lsfgp.train_LSF_tinygp(X,Y,Y_err,scatter=scatter)
+        LSF_solution = lsfgp.train_LSF_multistart_ray(X, Y, Y_err, 
+                                                  scatter=scatter, 
+                                                  num_starts=4)
         logger.info(f"Found solution with scatter")
     else:
         scatter=None
