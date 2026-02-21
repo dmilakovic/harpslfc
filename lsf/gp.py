@@ -110,7 +110,8 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     
     # 2. Generate a list of diverse starting guesses (modifying lengths/amps)
     starts = generate_starting_guesses(X, Y, Y_err, num_starts)
-    bounds = get_lsf_bounds(X, Y, Y_err) # Use existing bounds logic [4]
+    print(X, Y, Y_err)
+    bounds = get_lsf_bounds(X, Y, Y_err) 
 
     # 3. Launch parallel optimization tasks
     futures = [
