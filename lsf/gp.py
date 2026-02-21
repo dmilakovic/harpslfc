@@ -44,7 +44,13 @@ def get_lsf_bounds(X, Y, Y_err):
 
     # Initial guess for the mean function (A, mu, sigma, offset)
     p0 = (np.max(Y), 0, np.std(X), 0)
-    
+    cut = _check_arrays(X, Y, Y_err)
+    if len(cut)<2:
+        logger.warning('Data is wrong!')
+        print(X,Y,Y_err)
+    X = X[cut]
+    Y = Y[cut]
+    Y_err = Y_err[cut]
     # Perform a preliminary Gaussian fit to establish constraint center
     # Logic follows gp.txt [3]
     popt, pcov = curve_fit(hf.gauss4p, X, Y, sigma=Y_err, absolute_sigma=False, p0=p0)
@@ -110,7 +116,6 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     
     # 2. Generate a list of diverse starting guesses (modifying lengths/amps)
     starts = generate_starting_guesses(X, Y, Y_err, num_starts)
-    print(X, Y, Y_err)
     bounds = get_lsf_bounds(X, Y, Y_err) 
 
     # 3. Launch parallel optimization tasks
