@@ -51,11 +51,9 @@ def get_lsf_bounds(X, Y, Y_err):
     X = X[cut]
     Y = Y[cut]
     Y_err = Y_err[cut]
-    print('GET_LSF_BOUNDS data cleaning ok')
     # Perform a preliminary Gaussian fit to establish constraint center
     # Logic follows gp.txt [3]
     popt, pcov = curve_fit(hf.gauss4p, X, Y, sigma=Y_err, absolute_sigma=False, p0=p0)
-    print("GET_LSF_BOUNDS Gaussian fit ok")
     perr = np.sqrt(np.diag(pcov))
     
     # The 'kappa' factor determines the width of the search space 
@@ -65,7 +63,7 @@ def get_lsf_bounds(X, Y, Y_err):
     lower_bounds = dict(
         mf_amp       = popt[0]-kappa*perr[0],
         mf_loc       = popt[1]-kappa*perr[1],
-        mf_log_sig   = np.log(popt[2]-kappa*perr[2]),
+        mf_log_sig   = np.log(np.clip(popt[2]-kappa*perr[2], 1e-10, 1e10)),
         mf_const     = popt[3]-kappa*perr[3],
         gp_log_amp   = -4., #popt[0]/3.-kappa*perr[0],
         gp_log_scale = -1.,
@@ -133,7 +131,9 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     valid_results = [res for res in results if res is not None]
     if not valid_results:
         raise RuntimeError("All hyperparameter optimization starts failed.")
-        
+    
+    print(valid_results)
+    print(type(valid_results))
     best_params = min(valid_results, key=lambda x: x[5])
     return best_params
 
@@ -218,7 +218,7 @@ def train_LSF_tinygp(X,Y,Y_err,scatter=None, return_only_init=False):
     lower_bounds = dict(
         mf_amp       = popt[0]-kappa*perr[0],
         mf_loc       = popt[1]-kappa*perr[1],
-        mf_log_sig   = np.log(popt[2]-kappa*perr[2]),
+        mf_log_sig   = np.log(np.clip(popt[2]-kappa*perr[2], 1e-10, 1e10)),
         mf_const     = popt[3]-kappa*perr[3],
         gp_log_amp   = -4., #popt[0]/3.-kappa*perr[0],
         gp_log_scale = -1.,
