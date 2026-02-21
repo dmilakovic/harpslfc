@@ -94,7 +94,6 @@ def run_lsf_optimization_task(theta_start, X, Y, Y_err, scatter, bounds):
     JAX JIT is utilized within the loss_LSF function.
     """
     # Import within task to ensure availability on remote workers
-    from harps.lsf.gp import loss_LSF 
     
     lbfgsb = jaxopt.ScipyBoundedMinimize(
         fun=partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter),
@@ -109,7 +108,42 @@ def run_lsf_optimization_task(theta_start, X, Y, Y_err, scatter, bounds):
     except Exception as e:
         return None, jnp.inf
     
+def run_lsf_optimization_local(theta_start, X, Y, Y_err, scatter, bounds):
+    """Local helper to run optimization without Ray .remote overhead."""
+    lbfgsb = jaxopt.ScipyBoundedMinimize(
+        fun=partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter),
+        method="l-bfgs-b"
+    )
+    try:
+        solution = lbfgsb.run(theta_start, bounds=bounds)
+        return solution.params, solution.state.fun_val
+    except Exception:
+        return None, jnp.inf
+    
 def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
+    """
+    Revised multi-start GP training. 
+    Runs optimizations serially to prevent nested Ray deadlocks.
+    """
+    # 1. Generate diverse starting guesses
+    starts = generate_starting_guesses(X, Y, Y_err, num_starts)
+    bounds = get_lsf_bounds(X, Y, Y_err)
+    
+    # 2. Execute optimizations serially on the current worker
+    results = []
+    for s in starts:
+        res = run_lsf_optimization_local(s, X, Y, Y_err, scatter, bounds)
+        results.append(res)
+    
+    # 3. Filter failures and choose the best log-likelihood [3, 4]
+    valid_results = [res for res in results if res is not None]
+    if not valid_results:
+        raise RuntimeError("All hyperparameter optimization starts failed.")
+        
+    best_params = min(valid_results, key=lambda x: x[5])
+    return best_params
+    
+def train_LSF_multistart_ray_distributed(X, Y, Y_err, scatter=None, num_starts=4):
     """
     Coordinating function for multi-start GP training.
     """

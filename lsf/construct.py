@@ -194,14 +194,19 @@ def model_1s_4ray(od,pixl,pixr,x1s,flx1s,err1s,
               f'Printing err1s: {repr(err1s)}'
         # print(msg)
         logger.error(msg)
+    logger.info(f"Finished segment {od}/{segm}")
     return out
 
 @ray.remote
-def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, **kwargs):
+def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
+                **kwargs):
     """
     Ray Task: Processes an entire order using JAX vectorization [1].
     """
-    
+    if logger is not None:
+        logger = logger.getChild('from_spectrum_2d')
+    else:
+        logger = logging.getLogger(__name__).getChild('from_spectrum_2d')
     # 1. Prepare uniform stacks for vectorization [1, 2]
     max_pts = 600 # Buffer size defined in spectrum container [4]
     batch_X, batch_Y, batch_Yerr = [], [], []
@@ -230,9 +235,15 @@ def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, **kwargs):
         od, pixl, pixr = order_data_list[i]
         # Call the single-segment solver [6]
         # Independence is maintained while Ray manages the batch distribution
-        res = model_1s_4ray(od,pixl,pixr,X_stack,Y_stack,Yerr_stack,
+        res = model_1s_4ray(od,pixl,pixr,
+                            X_stack[od,pixl:pixr],
+                            Y_stack[od,pixl:pixr],
+                            Yerr_stack[od,pixl:pixr],
+                            logger=logger,
                         **kwargs)
+        logger.info(f"Finished {od}/{pixl}:{pixr}")
         results.append(res)
+        
     return results
 
 #@profile
@@ -885,7 +896,7 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
                     plot=plot,
                     save_plot=save_plot,
                     metadata=metadata,
-                    logger=None
+                    logger=logger
                     ) 
                 for od, segments in order_groups.items()
                 ]
