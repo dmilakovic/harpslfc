@@ -51,9 +51,11 @@ def get_lsf_bounds(X, Y, Y_err):
     X = X[cut]
     Y = Y[cut]
     Y_err = Y_err[cut]
+    print('GET_LSF_BOUNDS data cleaning ok')
     # Perform a preliminary Gaussian fit to establish constraint center
     # Logic follows gp.txt [3]
     popt, pcov = curve_fit(hf.gauss4p, X, Y, sigma=Y_err, absolute_sigma=False, p0=p0)
+    print("GET_LSF_BOUNDS Gaussian fit ok")
     perr = np.sqrt(np.diag(pcov))
     
     # The 'kappa' factor determines the width of the search space 
