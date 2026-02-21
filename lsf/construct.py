@@ -442,6 +442,8 @@ def construct_tinygp(x,y,y_err,plot=False,
     #     print(X,kwargs['metadata'])
     # LSF_solution_nosct = lsfgp.train_LSF_tinygp(X,Y,Y_err)
     LSF_solution_nosct = lsfgp.train_LSF_multistart_ray(X, Y, Y_err, num_starts=4)
+    print(LSF_solution_nosct)
+    print(type(LSF_solution_nosct))
     logger.info(f"Found solution without scatter")
     if model_scatter:
         scatter = lsfgp.train_scatter_tinygp(X,Y,Y_err,LSF_solution_nosct)
