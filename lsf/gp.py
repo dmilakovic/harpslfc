@@ -63,24 +63,24 @@ def get_lsf_bounds(X, Y, Y_err):
     kappa = 5
     
     lower_bounds = dict(
-        mf_amp      = popt - kappa * perr,
-        mf_loc      = popt[4] - kappa * perr[4],
-        mf_log_sig  = np.log(popt[5] - kappa * perr[5]),
-        mf_const    = popt[6] - kappa * perr[6],
-        gp_log_amp  = -4., 
+        mf_amp       = popt[0]-kappa*perr[0],
+        mf_loc       = popt[1]-kappa*perr[1],
+        mf_log_sig   = np.log(popt[2]-kappa*perr[2]),
+        mf_const     = popt[3]-kappa*perr[3],
+        gp_log_amp   = -4., #popt[0]/3.-kappa*perr[0],
         gp_log_scale = -1.,
-        log_var_add = -15.,
+        log_var_add  = -15.,
+    )
+    upper_bounds = dict(
+        mf_amp       = popt[0]+kappa*perr[0],
+        mf_loc       = popt[1]+kappa*perr[1],
+        mf_log_sig   = np.log(popt[2]+kappa*perr[2]),
+        mf_const     = popt[3]+kappa*perr[3],
+        gp_log_amp   = 4., # popt[0]/3.+kappa*perr[0],
+        gp_log_scale = 1.,
+        log_var_add  = 1.5,
     )
     
-    upper_bounds = dict(
-        mf_amp      = popt + kappa * perr,
-        mf_loc      = popt[4] + kappa * perr[4],
-        mf_log_sig  = np.log(popt[5] + kappa * perr[5]),
-        mf_const    = popt[6] + kappa * perr[6],
-        gp_log_amp  = 4., 
-        gp_log_scale = 1.,
-        log_var_add = 1.5,
-    )
     
     return (lower_bounds, upper_bounds)
 
