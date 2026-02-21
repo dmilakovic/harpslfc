@@ -927,10 +927,13 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
                 logger=None
             )
         # 4. Asynchronous collection of results
-        results = ray.get(futures)
+        batched_results = ray.get(futures)
         
+    results = [seg for order_list in batched_results for seg in order_list]
+    print(type(results))
     for i,lsf1s_out in enumerate(results):
-        if lsf1s_out[0] == None:
+        # if lsf1s_out[0] is None:
+        if isinstance(lsf1s_out, tuple) and lsf1s_out is None:
             msg = f"LSF1s model order {lsf1s_out[1]} segm {lsf1s_out[2]} failed"
             logger.critical(msg)
         else:
