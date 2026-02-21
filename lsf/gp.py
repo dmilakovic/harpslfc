@@ -154,7 +154,7 @@ def generate_starting_guesses(X, Y, Y_err, n):
         
     return guesses
     
-def train_LSF_tinygp(X,Y,Y_err,scatter=None):
+def train_LSF_tinygp(X,Y,Y_err,scatter=None, return_only_init=False):
     '''
     Returns parameters which minimise the loss function defined below.
 
@@ -203,6 +203,9 @@ def train_LSF_tinygp(X,Y,Y_err,scatter=None):
         gp_log_scale  = 0.,
         log_var_add   = -5.,
     )
+    if return_only_init:
+        return theta
+    
     kappa = 5
     lower_bounds = dict(
         mf_amp       = popt[0]-kappa*perr[0],
