@@ -140,7 +140,7 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     if not valid_results:
         raise RuntimeError("All hyperparameter optimization starts failed.")
         
-    best_params = min(valid_results, key=lambda x: x[5])
+    best_params = min(valid_results, key=lambda x: x[1])
     return best_params
     
 def train_LSF_multistart_ray_distributed(X, Y, Y_err, scatter=None, num_starts=4):
