@@ -24,10 +24,15 @@ import ray
 def loss_LSF(theta,X,Y,Y_err,scatter=None):
     gp = build_LSF_GP(theta,X,Y,Y_err,scatter)
     return -gp.log_probability(Y)
+
+vectorized_loss_LSF = jax.vmap(loss_LSF, in_axes=(0, 0, 0, 0, None))
+
 @jax.jit
 def loss_scatter(theta,X,Y,Y_err):
     gp = build_scatter_GP(theta,X,Y_err)
     return -gp.log_probability(Y)
+
+vectorized_loss_scatter = jax.vmap(loss_scatter, in_axes=(0, 0, 0, 0, None))
 
 def _check_arrays(*args):
     conditions = np.array([np.isfinite(_) for _ in args])

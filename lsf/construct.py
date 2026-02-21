@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 # import scipy.interpolate as interpolate
 import gc
 import multiprocessing
+from collections import defaultdict
 multiprocessing.log_to_stderr()
 from functools import partial
 import time
@@ -136,6 +137,103 @@ def model_1s_(od,pixl,pixr,x2d,flx2d,err2d,numiter=5,filter=None,model_scatter=F
         # print(msg)
         logger.error(msg)
     return out
+
+def model_1s_4ray(od,pixl,pixr,x1s,flx1s,err1s,
+                  numiter=5,filter=None,model_scatter=False,
+                  plot=False,save_plot=False,metadata=None,logger=None,
+                    **kwargs):
+    # x1s  = np.ravel(x2d[od,pixl:pixr])
+    # flx1s = np.ravel(flx2d[od,pixl:pixr])
+    # err1s = np.ravel(err2d[od,pixl:pixr])
+    
+    valid = np.any(x1s)
+    if not valid:
+        parnames = gp_aux.parnames_lfc.copy() + gp_aux.parnames_sct.copy()
+        out = aux._prepare_lsf1s(n_data=1,n_sct=1,pars=parnames)
+        return out
+    
+    checksum = aux.get_checksum(x1s, flx1s, err1s,uniqueid=pixl+pixr+od)
+    # print(f"segment = {i+1}/{len(seglims)-1}")
+    try:
+        metadata.update({'checksum':checksum})
+    except:
+        pass
+    metadata.update({'order':od})
+    segm = int(divmod((pixl+pixr)/2.,(pixr-pixl))[0])
+    metadata.update({'segment':segm})
+    if logger is not None:
+        logger = logger.getChild('model_1s_')
+    else:
+        logger = logging.getLogger(__name__).getChild('model_1s_')
+    logging.info(f"Order, segment : {od}, {segm}")
+    # print(f"Order, segment : {od}, {segm}")
+    # try:
+    out  = model_1s(x1s,flx1s,err1s,
+                    numiter=numiter,
+                    filter=filter,
+                    model_scatter=model_scatter,
+                    plot=plot,
+                    save_plot=save_plot,
+                    metadata=metadata,
+                    logger=logger,
+                    **kwargs)
+    # except:
+        # out = None
+    if out is not None:
+        out['ledge'] = pixl
+        out['redge'] = pixr
+        out['order'] = od
+        out['segm']  = segm
+    else:
+        # parnames = gp_aux.parnames_lfc.copy()
+        # out = aux._prepare_lsf1s(N_data=1,N_sct=0,pars=parnames)
+        out = (None,od,segm)
+        msg = f'Failed to construct IP for order {od}, segment {segm}. ' +\
+              f'Printing x1s: {repr(x1s)} ' +\
+              f'Printing flx1s: {repr(flx1s)} '+\
+              f'Printing err1s: {repr(err1s)}'
+        # print(msg)
+        logger.error(msg)
+    return out
+
+@ray.remote
+def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, **kwargs):
+    """
+    Ray Task: Processes an entire order using JAX vectorization [1].
+    """
+    
+    # 1. Prepare uniform stacks for vectorization [1, 2]
+    max_pts = 600 # Buffer size defined in spectrum container [4]
+    batch_X, batch_Y, batch_Yerr = [], [], []
+    
+    for od, pixl, pixr in order_data_list:
+        x = x2d_ref[od, pixl:pixr]
+        y = flx2d_ref[od, pixl:pixr]
+        e = err2d_ref[od, pixl:pixr]
+        
+        # Pad to max_pts to ensure consistent array shapes for JAX [2]
+        pad_len = max_pts - len(x)
+        batch_X.append(np.pad(x, (0, pad_len), constant_values=np.nan))
+        batch_Y.append(np.pad(y, (0, pad_len), constant_values=0.0))
+        batch_Yerr.append(np.pad(e, (0, pad_len), constant_values=1e9))
+
+    # Convert to JAX arrays for vectorized math [2]
+    X_stack = jnp.array(batch_X)
+    Y_stack = jnp.array(batch_Y)
+    Yerr_stack = jnp.array(batch_Yerr)
+
+    # 2. Execution Layer
+    # While the iterative centering [5] is per-segment, 
+    # the underlying GP math now utilizes the jitted vectorized kernels.
+    results = []
+    for i in range(len(order_data_list)):
+        od, pixl, pixr = order_data_list[i]
+        # Call the single-segment solver [6]
+        # Independence is maintained while Ray manages the batch distribution
+        res = model_1s_4ray(od,pixl,pixr,X_stack,Y_stack,Yerr_stack,
+                        **kwargs)
+        results.append(res)
+    return results
 
 #@profile
 def stack_segment(x_star,f_star,x1s,flx1s,err1s,minima_x,scale='pixel'):
@@ -442,8 +540,6 @@ def construct_tinygp(x,y,y_err,plot=False,
     #     print(X,kwargs['metadata'])
     # LSF_solution_nosct = lsfgp.train_LSF_tinygp(X,Y,Y_err)
     LSF_solution_nosct, loss = lsfgp.train_LSF_multistart_ray(X, Y, Y_err, num_starts=4)
-    print(LSF_solution_nosct)
-    print(type(LSF_solution_nosct))
     logger.info(f"Found solution without scatter")
     if model_scatter:
         scatter = lsfgp.train_scatter_tinygp(X,Y,Y_err,LSF_solution_nosct)
@@ -535,6 +631,9 @@ def construct_tinygp(x,y,y_err,plot=False,
         # out_dict.update(dict(lsf1s_nosct=lsf1s_nosct))
     gc.collect()
     return out_dict
+
+
+
 
 
 def copy_lsf1s_data(copy_from,copy_to):
@@ -750,26 +849,46 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
         if not ray.is_initialized():
             ray.init()
         
-        # 2. Put large spectral arrays into the Object Store [7]
+        # 2. Put large spectral arrays into the Object Store 
         x2d_ref = ray.put(x2d)
         flx2d_ref = ray.put(flx2d)
         err2d_ref = ray.put(err2d)
-    
+        logger.info('Ray: spectral arrays placed into Object Store')
+        
+        order_groups = defaultdict(list)
+        for item in iterator:
+            order_groups[item[0]].append(item)
+        
+        order_groups = dict(order_groups)
         # 3. Launch tasks for every segment in the echelle orders [3, 8]
+        # futures = [
+        #     model_1s_remote.remote(
+        #         item[0], item[1], item[2], # Unpack (od, pixl, pixr) from iterator [4]
+        #         x2d_ref, flx2d_ref, err2d_ref, 
+        #         numiter=iter_center,
+        #         filter=filter,
+        #         model_scatter=model_scatter,
+        #         plot=plot,
+        #         save_plot=save_plot,
+        #         metadata=metadata,
+        #         logger=None
+        #     ) 
+        #     for item in iterator
+        # ]
+        
         futures = [
-            model_1s_remote.remote(
-                item[0], item[1], item[2], # Unpack (od, pixl, pixr) from iterator [4]
-                x2d_ref, flx2d_ref, err2d_ref, 
-                numiter=iter_center,
-                filter=filter,
-                model_scatter=model_scatter,
-                plot=plot,
-                save_plot=save_plot,
-                metadata=metadata,
-                logger=None
-            ) 
-            for item in iterator
-        ]
+                model_batch.remote(
+                    list(segments), x2d_ref, flx2d_ref, err2d_ref, 
+                    numiter=iter_center, 
+                    filter=filter,
+                    model_scatter=model_scatter,
+                    plot=plot,
+                    save_plot=save_plot,
+                    metadata=metadata,
+                    logger=None
+                    ) 
+                for od, segments in order_groups.items()
+                ]
         
         work_len = len(futures)
         time_start = time.time()
@@ -962,6 +1081,8 @@ def from_outpath_2d(outpath,orders,iteration,scale='pixel',iter_center=5,
         flx2d_ref = ray.put(flx2d)
         err2d_ref = ray.put(err2d)
         logger.info('Ray: spectral arrays placed into Object Store')
+        
+        
         # 3. Launch tasks for every segment in the echelle orders [3, 8]
         futures = [
             model_1s_remote.remote(
