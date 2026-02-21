@@ -88,7 +88,8 @@ def model_1s_(od,pixl,pixr,x2d,flx2d,err2d,numiter=5,filter=None,model_scatter=F
     flx1s = np.ravel(flx2d[od,pixl:pixr])
     err1s = np.ravel(err2d[od,pixl:pixr])
     
-    valid = np.any(x1s)
+    # valid = np.any(x1s)
+    valid = np.any((flx1s != 0) & np.isfinite(flx1s))
     if not valid:
         parnames = gp_aux.parnames_lfc.copy() + gp_aux.parnames_sct.copy()
         out = aux._prepare_lsf1s(n_data=1,n_sct=1,pars=parnames)
@@ -146,7 +147,8 @@ def model_1s_4ray(od,pixl,pixr,x1s,flx1s,err1s,
     # flx1s = np.ravel(flx2d[od,pixl:pixr])
     # err1s = np.ravel(err2d[od,pixl:pixr])
     
-    valid = np.any(x1s)
+    # valid = np.any(x1s)
+    valid = np.any((flx1s != 0) & np.isfinite(flx1s))
     if not valid:
         parnames = gp_aux.parnames_lfc.copy() + gp_aux.parnames_sct.copy()
         out = aux._prepare_lsf1s(n_data=1,n_sct=1,pars=parnames)
