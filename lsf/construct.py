@@ -242,9 +242,9 @@ def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
         # Call the single-segment solver [6]
         # Independence is maintained while Ray manages the batch distribution
         res = model_1s_4ray(od,pixl,pixr,
-                            X_stack[od,pixl:pixr],
-                            Y_stack[od,pixl:pixr],
-                            Yerr_stack[od,pixl:pixr],
+                            X_stack[i],
+                            Y_stack[i],
+                            Yerr_stack[i],
                             logger=logger,
                         **kwargs)
         print(res['order'], res['ledge'], res['redge'])
