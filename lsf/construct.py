@@ -890,7 +890,7 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
         #     ) 
         #     for item in iterator
         # ]
-        print(list(segments))
+        print([list(segments) for od, segments in order_groups.items()])
         futures = [
                 model_batch.remote(
                     list(segments), x2d_ref, flx2d_ref, err2d_ref, 
