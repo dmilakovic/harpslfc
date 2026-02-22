@@ -226,10 +226,10 @@ def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
     #     batch_Y.append(np.pad(y, (0, pad_len), constant_values=0.0))
     #     batch_Yerr.append(np.pad(e, (0, pad_len), constant_values=1e9))
 
-    # # Convert to JAX arrays for vectorized math [2]
-    # X_stack = jnp.array(batch_X)
-    # Y_stack = jnp.array(batch_Y)
-    # Yerr_stack = jnp.array(batch_Yerr)
+    # Convert to JAX arrays for vectorized math [2]
+    X_stack = jnp.array(x2d_ref)
+    Y_stack = jnp.array(flx2d_ref)
+    Yerr_stack = jnp.array(err2d_ref)
 
     # 2. Execution Layer
     # While the iterative centering [5] is per-segment, 
@@ -241,9 +241,9 @@ def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
         # Call the single-segment solver [6]
         # Independence is maintained while Ray manages the batch distribution
         res = model_1s_4ray(od,pixl,pixr,
-                            x2d_ref[od,pixl:pixr],
-                            flx2d_ref[od,pixl:pixr],
-                            err2d_ref[od,pixl:pixr],
+                            X_stack[od,pixl:pixr],
+                            Y_stack[od,pixl:pixr],
+                            Yerr_stack[od,pixl:pixr],
                             logger=logger,
                         **kwargs)
         logger.info(f"Finished {od}/{pixl}:{pixr}")
