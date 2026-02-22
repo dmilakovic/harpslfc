@@ -32,7 +32,7 @@ def loss_scatter(theta,X,Y,Y_err):
     gp = build_scatter_GP(theta,X,Y_err)
     return -gp.log_probability(Y)
 
-vectorized_loss_scatter = jax.vmap(loss_scatter, in_axes=(0, 0, 0, 0, None))
+vectorized_loss_scatter = jax.vmap(loss_scatter, in_axes=(0, 0, 0, 0))
 
 def _check_arrays(*args):
     conditions = np.array([np.isfinite(_) for _ in args])
@@ -87,6 +87,9 @@ def get_lsf_bounds(X, Y, Y_err):
     
     return (lower_bounds, upper_bounds)
 
+
+
+
 @ray.remote
 def run_lsf_optimization_task(theta_start, X, Y, Y_err, scatter, bounds):
     """
@@ -120,6 +123,9 @@ def run_lsf_optimization_local(theta_start, X, Y, Y_err, scatter, bounds):
     except Exception:
         return None, jnp.inf
     
+vectorized_run_lsf_optimization_local = jax.vmap(run_lsf_optimization_local, 
+                                                 in_axes=(0,None,None,None,None,None))
+    
 def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     """
     Revised multi-start GP training. 
@@ -130,10 +136,12 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     bounds = get_lsf_bounds(X, Y, Y_err)
     
     # 2. Execute optimizations serially on the current worker
-    results = []
-    for s in starts:
-        res = run_lsf_optimization_local(s, X, Y, Y_err, scatter, bounds)
-        results.append(res)
+    results = vectorized_run_lsf_optimization_local(starts,
+                                                    X, Y, Y_err, bounds)
+    # results = []
+    # for s in starts:
+    #     res = run_lsf_optimization_local(s, X, Y, Y_err, scatter, bounds)
+    #     results.append(res)
     
     # 3. Filter failures and choose the best log-likelihood [3, 4]
     valid_results = [res for res in results if res is not None]
@@ -143,38 +151,87 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     best_params = min(valid_results, key=lambda x: x[1])
     return best_params
     
-def train_LSF_multistart_ray_distributed(X, Y, Y_err, scatter=None, num_starts=4):
-    """
-    Coordinating function for multi-start GP training.
-    """
-    
-    # 1. Put data in Ray Object Store to prevent redundant copying
-    X_ref = ray.put(X)
-    Y_ref = ray.put(Y)
-    Y_err_ref = ray.put(Y_err)
-    
-    # 2. Generate a list of diverse starting guesses (modifying lengths/amps)
-    starts = generate_starting_guesses(X, Y, Y_err, num_starts)
-    bounds = get_lsf_bounds(X, Y, Y_err) 
 
-    # 3. Launch parallel optimization tasks
-    futures = [
-        run_lsf_optimization_task.remote(s, X_ref, Y_ref, Y_err_ref, scatter, bounds) 
-        for s in starts
-    ]
+
+def generate_theta_stack(X_stack, Y_stack, Yerr_stack):
+    """
+    Generates a PyTree of initial hyperparameter guesses for a batch of segments.
     
-    # 4. Collect results and choose the one with the minimum negative log-likelihood
-    results = ray.get(futures)
+    Each parameter in the returned dictionary is an array of shape (num_segments,),
+    enabling JAX to map operations across the batch dimension.
     
-    # Filter out failures
-    valid_results = [res for res in results if res is not None]
-    if not valid_results:
-        raise RuntimeError("All hyperparameter optimization starts failed.")
+    Parameters:
+    -----------
+    X_stack, Y_stack, Yerr_stack : jnp.ndarray
+        2D JAX arrays of shape (num_segments, num_points) containing padded data.
+        
+    Returns:
+    --------
+    theta_stack : dict
+        A PyTree where keys are hyperparameter names (e.g., 'mf_amp', 'gp_log_scale')
+        and values are arrays of initial guesses.
+    """
+    num_segs = X_stack.shape
+    # Initialize the dictionary keys based on the LFC parameter list [3]
+    theta_stack = {name: jnp.zeros(num_segs) for name in gp_aux.parnames_lfc}
     
-    # take the minimum of the second output of run_lsf_optimization_task,
-    # which is the negative log likelihood
-    best_params = min(valid_results, key=lambda x: x[1]) 
-    return best_params
+    for i in range(num_segs):
+        # Initial guess logic follows train_LSF_tinygp [1, 4]
+        # We assume data is centered (mf_loc ~ 0) and use standard deviations
+        A0 = jnp.nanmax(Y_stack[i])
+        s0 = jnp.clip(jnp.nanstd(X_stack[i]), 0.5, 2.0)
+        
+        theta_stack['mf_amp'] = theta_stack['mf_amp'].at[i].set(A0)
+        theta_stack['mf_loc'] = theta_stack['mf_loc'].at[i].set(0.0)
+        theta_stack['mf_log_sig'] = theta_stack['mf_log_sig'].at[i].set(jnp.log(s0))
+        theta_stack['mf_const'] = theta_stack['mf_const'].at[i].set(0.0)
+        theta_stack['gp_log_amp'] = theta_stack['gp_log_amp'].at[i].set(jnp.log(A0 / 5.0))
+        theta_stack['gp_log_scale'] = theta_stack['gp_log_scale'].at[i].set(0.0)
+        theta_stack['log_var_add'] = theta_stack['log_var_add'].at[i].set(-5.0)
+        
+    return theta_stack
+
+def get_bounds_stack(X_stack, Y_stack, Yerr_stack):
+    """
+    Generates lower and upper bound PyTrees for vectorized GP optimization.
+    
+    Parameters:
+    -----------
+    X_stack, Y_stack, Yerr_stack : jnp.ndarray
+        2D JAX arrays of shape (num_segments, num_points).
+        
+    Returns:
+    --------
+    bounds : tuple (dict, dict)
+        A tuple containing the lower_bounds and upper_bounds PyTrees.
+    """
+    num_segs = X_stack.shape
+    lb_stack = {name: jnp.zeros(num_segs) for name in gp_aux.parnames_lfc}
+    ub_stack = {name: jnp.zeros(num_segs) for name in gp_aux.parnames_lfc}
+    
+    for i in range(num_segs):
+        # Boundary logic adapted from get_lsf_bounds [1, 5]
+        A0 = jnp.nanmax(Y_stack[i])
+        
+        # Mean Function bounds
+        lb_stack['mf_amp'] = lb_stack['mf_amp'].at[i].set(0.5 * A0)
+        ub_stack['mf_amp'] = ub_stack['mf_amp'].at[i].set(2.0 * A0)
+        lb_stack['mf_loc'] = lb_stack['mf_loc'].at[i].set(-0.5) # Allow small shifts [4]
+        ub_stack['mf_loc'] = ub_stack['mf_loc'].at[i].set(0.5)
+        lb_stack['mf_log_sig'] = lb_stack['mf_log_sig'].at[i].set(jnp.log(0.1))
+        ub_stack['mf_log_sig'] = ub_stack['mf_log_sig'].at[i].set(jnp.log(5.0))
+        lb_stack['mf_const'] = lb_stack['mf_const'].at[i].set(-1.0)
+        ub_stack['mf_const'] = ub_stack['mf_const'].at[i].set(1.0)
+        
+        # GP Kernel bounds [7, 8]
+        lb_stack['gp_log_amp'] = lb_stack['gp_log_amp'].at[i].set(-4.0)
+        ub_stack['gp_log_amp'] = ub_stack['gp_log_amp'].at[i].set(4.0)
+        lb_stack['gp_log_scale'] = lb_stack['gp_log_scale'].at[i].set(-1.0)
+        ub_stack['gp_log_scale'] = ub_stack['gp_log_scale'].at[i].set(1.0)
+        lb_stack['log_var_add'] = lb_stack['log_var_add'].at[i].set(-15.0)
+        ub_stack['log_var_add'] = ub_stack['log_var_add'].at[i].set(1.5)
+        
+    return (lb_stack, ub_stack)
 
 def generate_starting_guesses(X, Y, Y_err, n):
     """

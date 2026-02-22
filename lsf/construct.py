@@ -182,7 +182,7 @@ def model_1s_4ray(od,pixl,pixr,x1s,flx1s,err1s,
     # except:
         # out = None
     logger.info("Out is None", out is None)
-    print("Out is None: ", out is None, pixl, pixr, od, segm)
+    # print("Out is None: ", out is None, pixl, pixr, od, segm)
     if out is not None:
         logger.info(f"{out.dtype=}")
         out['ledge'] = pixl
@@ -233,23 +233,21 @@ def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
     Yerr_stack = jnp.array(batch_Yerr)
 
     # 2. Execution Layer
-    # While the iterative centering [5] is per-segment, 
-    # the underlying GP math now utilizes the jitted vectorized kernels.
-    results = []
-    for i in range(len(order_data_list)):
-        od, pixl, pixr = order_data_list[i]
-        logger.info(f'Order = {od}\t pixl={pixl}\t pixr={pixr}')
-        # Call the single-segment solver [6]
-        # Independence is maintained while Ray manages the batch distribution
-        res = model_1s_4ray(od,pixl,pixr,
-                            X_stack[i],
-                            Y_stack[i],
-                            Yerr_stack[i],
-                            logger=logger,
-                        **kwargs)
-        print(res['order'], res['ledge'], res['redge'])
-        logger.info(f"Finished {od}/{pixl}:{pixr}")
-        results.append(res[0])
+    
+    theta_stack = lsfgp.generate_theta_stack(X_stack, Y_stack, Yerr_stack)
+    bounds_stack = lsfgp.get_bounds_stack(X_stack, Y_stack, Yerr_stack)
+    
+    
+    # Execute the optimization for all segments simultaneously
+    best_thetas = lsfgp.train_LSF_batch(X_stack, Y_stack, Yerr_stack, 
+                                  theta_stack, bounds_stack)
+    
+    for i, (od, pixl, pixr) in enumerate(order_data_list)):
+        
+    results = [gp_aux.format_as_lsf1s(best_thetas[i]) ]
+    return results
+
+
         
     return results
 
@@ -354,6 +352,25 @@ def get_initial_guess(x1s,flx1s,err1s,minima_x):
         
     return minima_x, x_star_0, f_star_0
 
+@ray.remote
+def model_1d(order_data_list, x2d_ref, flx2d_ref, err2d_ref, **kwargs):
+    """
+    Ray Task: Processes a batch of segments
+    """
+    results = []
+    for od, pixl, pixr in order_data_list:
+        # Extract data for the specific segment
+        x1s = np.ravel(x2d_ref[od, pixl:pixr])
+        flx1s = np.ravel(flx2d_ref[od, pixl:pixr])
+        err1s = np.ravel(err2d_ref[od, pixl:pixr])
+        
+        # Call the working iterative logic
+        lsf_output = model_1s(x1s, flx1s, err1s, **kwargs)
+        
+        if lsf_output is not None:
+            lsf_output.update({'order': od, 'ledge': pixl, 'redge': pixr})
+        results.append(lsf_output)
+    return results
 
 def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
              model_scatter=False,
@@ -796,152 +813,75 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
     
     
     
-    option=3
-    if option!=3:
-        partial_function = partial(model_1s_,
-                                    x2d=x2d,
-                                    flx2d=flx2d,
-                                    err2d=err2d,
-                                    numiter=iter_center,
-                                    filter=filter,
-                                    model_scatter=model_scatter,
-                                    plot=plot,
-                                    save_plot=save_plot,
-                                    metadata=metadata,
-                                    logger=None
-                                    )
-    if option==1:
-        with multiprocessing.Pool() as pool:
-            results = pool.starmap(partial_function,
-                                    iterator)
-    elif option==2:
-        # job_queue = multiprocessing.Queue(maxsize=8)
-        # results   = multiprocessing.Queue()
-        # for item in iterator:
-            # job_queue.put(item)
-        logger.info('Starting LSF fitting')
-        manager = multiprocessing.Manager()
-        inq = manager.Queue()
-        outq = manager.Queue()
     
-        # construct the workers
-        nproc = multiprocessing.cpu_count()
-        
-        logger.info(f"Using {nproc} workers")
-        workers = [Worker(str(name+1), partial_function,inq, outq,logger) 
-                   for name in range(nproc)]
-        for worker in workers:
-            worker.start()
+    logger.info('Starting distributed LSF fitting via Ray')
     
-        # add data to the queue for processing
-        work_len = len(iterator)
-        for item in iterator:
-            # print(f"Item before putting into queue: {item}")
-            inq.put(item)
+    # 1. Initialize Ray (Auto-detects laptop cores or HPC cluster)
+    if not ray.is_initialized():
+        ray.init()
     
-        while outq.qsize() < work_len:
-            # waiting for workers to finish
-            done = outq.qsize()
-            progress = done/(work_len)
-            time_elapsed = time.time() - time_start
-            progress_bar.update(progress,name=f'LSF_2d {scale} {iteration}',
-                               time=time_elapsed,
-                               logger=None)
-            
-            # print("Waiting for workers. Out queue size {}".format(outq.qsize()))
-            time.sleep(1)
+    # 2. Put large spectral arrays into the Object Store 
+    x2d_ref = ray.put(x2d)
+    flx2d_ref = ray.put(flx2d)
+    err2d_ref = ray.put(err2d)
+    logger.info('Ray: spectral arrays placed into Object Store')
     
-        # clean up
-        for worker in workers:
-            worker.terminate()
+    order_groups = defaultdict(list)
+    for item in iterator:
+        order_groups[item[0]].append(item)
     
-        # print the outputs
-        results = []
-        while not outq.empty():
-            results.append(outq.get())
+    order_groups = dict(order_groups)
     
-    elif option == 3:
-        logger.info('Starting distributed LSF fitting via Ray')
-        
-        # 1. Initialize Ray (Auto-detects laptop cores or HPC cluster)
-        if not ray.is_initialized():
-            ray.init()
-        
-        # 2. Put large spectral arrays into the Object Store 
-        x2d_ref = ray.put(x2d)
-        flx2d_ref = ray.put(flx2d)
-        err2d_ref = ray.put(err2d)
-        logger.info('Ray: spectral arrays placed into Object Store')
-        
-        order_groups = defaultdict(list)
-        for item in iterator:
-            order_groups[item[0]].append(item)
-        
-        order_groups = dict(order_groups)
-        # 3. Launch tasks for every segment in the echelle orders [3, 8]
-        # futures = [
-        #     model_1s_remote.remote(
-        #         item[0], item[1], item[2], # Unpack (od, pixl, pixr) from iterator [4]
-        #         x2d_ref, flx2d_ref, err2d_ref, 
-        #         numiter=iter_center,
-        #         filter=filter,
-        #         model_scatter=model_scatter,
-        #         plot=plot,
-        #         save_plot=save_plot,
-        #         metadata=metadata,
-        #         logger=None
-        #     ) 
-        #     for item in iterator
-        # ]
-        print([list(segments) for od, segments in order_groups.items()])
-        futures = [
-                model_batch.remote(
-                    list(segments), x2d_ref, flx2d_ref, err2d_ref, 
-                    numiter=iter_center, 
-                    filter=filter,
-                    model_scatter=model_scatter,
-                    plot=plot,
-                    save_plot=save_plot,
-                    metadata=metadata,
-                    logger=logger
-                    ) 
-                for od, segments in order_groups.items()
-                ]
-        
-        work_len = len(futures)
-        time_start = time.time()
-        finished_count = 0
-        unready = futures
-        results_ordered = [None] * work_len
-        # Map the futures to their original iterator indices to preserve order
-        future_to_index = {f: i for i, f in enumerate(futures)}
+    print([list(segments) for od, segments in order_groups.items()])
+    futures = [
+            model_1d.remote(
+                list(segments), 
+                x2d_ref, flx2d_ref, err2d_ref, 
+                numiter=iter_center, 
+                filter=filter,
+                model_scatter=model_scatter,
+                plot=plot,
+                save_plot=save_plot,
+                metadata=metadata,
+                logger=logger
+                ) 
+            for od, segments in order_groups.items()
+            ]
+    
+    work_len = len(futures)
+    time_start = time.time()
+    finished_count = 0
+    unready = futures
+    results_ordered = [None] * work_len
+    # Map the futures to their original iterator indices to preserve order
+    future_to_index = {f: i for i, f in enumerate(futures)}
 
-        while unready:
-            # Wait for at least one task to finish (timeout=1s to refresh time display)
-            ready, unready = ray.wait(unready, num_returns=1, timeout=1.0)
-            
-            # Update stats
-            finished_count = work_len - len(unready)
-            progress = finished_count / work_len
-            time_elapsed = time.time() - time_start
-            
-            progress_bar.update(
-                progress, 
-                name=f'Ray LSF Fitting {scale} {iteration}',
-                time=time_elapsed,
-                logger=None
-            )
-        # 4. Asynchronous collection of results
-        batched_results = ray.get(futures)
+    while unready:
+        # Wait for at least one task to finish (timeout=1s to refresh time display)
+        ready, unready = ray.wait(unready, num_returns=1, timeout=1.0)
+        
+        # Update stats
+        finished_count = work_len - len(unready)
+        progress = finished_count / work_len
+        time_elapsed = time.time() - time_start
+        
+        progress_bar.update(
+            progress, 
+            name=f'Ray LSF Fitting {scale} {iteration}',
+            time=time_elapsed,
+            logger=None
+        )
+    # 4. Asynchronous collection of results
+    batched_results = ray.get(futures)
         
     results = [seg for order_list in batched_results for seg in order_list]
     logger.info(f'{len(results)=}')
     
     for i,lsf1s_out in enumerate(results):
-        logger.info(f"{lsf1s_out[0]['order']=}")
-        logger.info(f"{lsf1s_out[0]['segm']=}")
-        logger.info(f"{lsf1s_out[0]['ledge']=}")
-        logger.info(f"{lsf1s_out[0]['redge']=}")
+        logger.info(f"{lsf1s_out['order']=}")
+        logger.info(f"{lsf1s_out['segm']=}")
+        logger.info(f"{lsf1s_out['ledge']=}")
+        logger.info(f"{lsf1s_out['redge']=}")
         # if lsf1s_out[0] is None:
         if isinstance(lsf1s_out, tuple) and lsf1s_out is None:
             msg = f"LSF1s model order {lsf1s_out[1]} segm {lsf1s_out[2]} failed"

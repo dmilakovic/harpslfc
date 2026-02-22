@@ -14,6 +14,7 @@ parnames_all = parnames_lfc + parnames_sct
 import numpy as np
 import harps.lsf.read as hread
 import harps.lsf.gp as hlsfgp
+import harps.lsf.aux as aux
 import harps.lines_aux as laux
 import harps.settings as hs
 import jax
@@ -515,3 +516,33 @@ def plot_result(optpars,lsf1d,pix,flux,error,interpolate=True):
     # ax2.set_ylim(-5,5)
     ax1.legend()
     
+
+def format_as_lsf1s(theta_i, n_data=600, n_sct=40):
+    """
+    Transforms optimized JAX hyperparameters into a structured NumPy LSF model.
+    
+    Parameters:
+    -----------
+    theta_i : dict
+        A dictionary containing optimized scalars for a single segment.
+    n_data : int
+        Size of the data buffer (default 600) [11].
+    n_sct : int
+        Size of the scatter buffer (default 40) [12].
+        
+    Returns:
+    --------
+    lsf1s : np.ndarray
+        A structured NumPy array containing hyperparameters and metadata slots.
+    """
+    # Use existing utility to create the structured container [9, 13]
+    parnames = parnames_lfc.copy()
+    lsf1s = aux._prepare_lsf1s(n_data=n_data, n_sct=n_sct, pars=parnames)
+    
+    # Map the dictionary values to the structured array fields [14, 15]
+    for name in parnames:
+        if name in theta_i:
+            # JAX device arrays are converted to NumPy scalars here
+            lsf1s[name] = float(theta_i[name])
+            
+    return lsf1s
