@@ -120,7 +120,8 @@ def run_lsf_optimization_local(theta_start, X, Y, Y_err, scatter, bounds):
     try:
         solution = lbfgsb.run(theta_start, bounds=bounds)
         return solution.params, solution.state.fun_val
-    except Exception:
+    except Exception as e:
+        print(f"EXCEPTION {e}")
         return None, jnp.inf
     
 vectorized_run_lsf_optimization_local = jax.vmap(run_lsf_optimization_local, 
