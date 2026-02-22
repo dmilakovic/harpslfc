@@ -933,7 +933,7 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
     logger.info(f'{len(results)=}')
     
     for i,lsf1s_out in enumerate(results):
-        logger.info(f"{lsf1s_out['od']=}")
+        logger.info(f"{lsf1s_out['order']=}")
         logger.info(f"{lsf1s_out['segm']=}")
         logger.info(f"{lsf1s_out['pixl']=}")
         logger.info(f"{lsf1s_out['pixr']=}")
