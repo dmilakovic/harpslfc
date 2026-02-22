@@ -151,11 +151,13 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     
     # 3. Filter failures and choose the best log-likelihood [3, 4]
     valid_results = [res for res in results if res is not None]
+    print('valid results')
     print(valid_results)
     if not valid_results:
         raise RuntimeError("All hyperparameter optimization starts failed.")
         
     best_params = min(valid_results, key=lambda x: x[1])
+    print('best params')
     print(best_params)
     return best_params
     
