@@ -48,7 +48,7 @@ def get_lsf_bounds(X, Y, Y_err):
     """
 
     # Initial guess for the mean function (A, mu, sigma, offset)
-    p0 = (np.max(Y), 0, np.std(X), 0)
+    p0 = (jnp.max(Y), 0, jnp.std(X), 0)
     cut = _check_arrays(X, Y, Y_err)
     if len(cut)<2:
         logger.warning('Data is wrong!')
@@ -137,8 +137,8 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     bounds = get_lsf_bounds(X, Y, Y_err)
     
     starts_batched = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *starts)
-    print('starts batched')
-    print(starts_batched)
+    print('bounds')
+    print(bounds)
     # 2. Execute optimizations serially on the current worker
     results = vectorized_run_lsf_optimization_local(starts_batched,
                                                     X, 
@@ -263,9 +263,9 @@ def generate_starting_guesses(X, Y, Y_err, n):
     for i in range(1, n):
         new_theta = base_theta.copy()
         # Perturb length-scale log-space by +/- 0.5
-        new_theta['gp_log_scale'] += np.random.uniform(-0.5, 0.5)
+        new_theta['gp_log_scale'] += jnp.random.uniform(-0.5, 0.5)
         # Perturb GP amplitude
-        new_theta['gp_log_amp'] += np.random.uniform(-1.0, 1.0)
+        new_theta['gp_log_amp'] += jnp.random.uniform(-1.0, 1.0)
         guesses.append(new_theta)
         
     return guesses
