@@ -337,6 +337,7 @@ def line(
 
     # --- 1. LSF Preparation ---
     num_interp_points = 2 if interpolate else 1
+    print(bary, len(LSF1d_obj))
     lsf_loc_x, lsf_loc_y = LSF1d_obj.interpolate_lsf(bary, num_interp_points)
     sct_loc_x, sct_loc_y = LSF1d_obj.interpolate_scatter(bary, num_interp_points) # sct_loc currently unused by residuals2
     

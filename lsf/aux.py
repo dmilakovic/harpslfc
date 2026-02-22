@@ -1236,14 +1236,14 @@ def solve_line(i,linelist,x2d,flx2d,err2d,LSF2d_nm,ftype='gauss',scale='pix',
     success = False
     pars = "None"
     chisq = np.nan
-    print(LSF1d)
+    print(len(LSF1d))
     if LSF1d is None or len(LSF1d) == 0:
         logger.warning(f"Order {od}: No valid LSF models found. Skipping line {i}.")
         # Return a failed line result to stay consistent with the bulk_fit loop
         line[f'lsf_{scl}'] = np.nan
         return line, np.zeros_like(flx1l)
     try:
-        # logger.info(lsf1d.interpolate(bary))
+        logger.info(lsf1d.interpolate(bary))
         # output = hfit.lsf(x1l,flx1l,bkg1l,err1l,lsf1d,
         #                   interpolate=interpolate,
         #                   output_model=True)
