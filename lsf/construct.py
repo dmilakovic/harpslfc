@@ -181,7 +181,9 @@ def model_1s_4ray(od,pixl,pixr,x1s,flx1s,err1s,
                     **kwargs)
     # except:
         # out = None
+    logger.info("Out is None", out is None)
     if out is not None:
+        logger.info(f"{out.dtype=}")
         out['ledge'] = pixl
         out['redge'] = pixr
         out['order'] = od
@@ -203,7 +205,7 @@ def model_1s_4ray(od,pixl,pixr,x1s,flx1s,err1s,
 def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
                 **kwargs):
     """
-    Ray Task: Processes an entire order using JAX vectorization [1].
+    Ray Task: Processes an entire order using JAX vectorization.
     """
     if logger is not None:
         logger = logger.getChild('from_spectrum_2d')
@@ -888,7 +890,7 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
         #     ) 
         #     for item in iterator
         # ]
-        
+        print(list(segments))
         futures = [
                 model_batch.remote(
                     list(segments), x2d_ref, flx2d_ref, err2d_ref, 
