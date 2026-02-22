@@ -48,37 +48,37 @@ def get_lsf_bounds(X, Y, Y_err):
     """
 
     # Initial guess for the mean function (A, mu, sigma, offset)
-    p0 = (jnp.max(Y), 0, jnp.std(X), 0)
-    cut = _check_arrays(X, Y, Y_err)
-    if len(cut)<2:
-        logger.warning('Data is wrong!')
-        print(X,Y,Y_err)
-    X = X[cut]
-    Y = Y[cut]
-    Y_err = Y_err[cut]
+    # p0 = (jnp.max(Y), 0, jnp.std(X), 0)
+    # cut = _check_arrays(X, Y, Y_err)
+    # if len(cut)<2:
+        # logger.warning('Data is wrong!')
+        # print(X,Y,Y_err)
+    # X = X[cut]
+    # Y = Y[cut]
+    # Y_err = Y_err[cut]
     # Perform a preliminary Gaussian fit to establish constraint center
     # Logic follows gp.txt [3]
-    popt, pcov = curve_fit(hf.gauss4p, X, Y, sigma=Y_err, absolute_sigma=False, p0=p0)
-    perr = np.sqrt(np.diag(pcov))
+    # popt, pcov = curve_fit(hf.gauss4p, X, Y, sigma=Y_err, absolute_sigma=False, p0=p0)
+    # perr = np.sqrt(np.diag(pcov))
     
     # The 'kappa' factor determines the width of the search space 
     # around the initial fit. gp.txt uses 5 [1].
-    kappa = 5
+    # kappa = 5
     
     lower_bounds = dict(
-        mf_amp       = popt[0]-kappa*perr[0],
-        mf_loc       = popt[1]-kappa*perr[1],
-        mf_log_sig   = np.log(np.clip(popt[2]-kappa*perr[2], 1e-10, 1e10)),
-        mf_const     = popt[3]-kappa*perr[3],
+        mf_amp       = 0.8*np.max(Y), #popt[0]-kappa*perr[0],
+        mf_loc       = -1.0, #popt[1]-kappa*perr[1],
+        mf_log_sig   = 1e-10, #np.log(np.clip(popt[2]-kappa*perr[2], 1e-10, 1e10)),
+        mf_const     = -0.1, #popt[3]-kappa*perr[3],
         gp_log_amp   = -4., #popt[0]/3.-kappa*perr[0],
         gp_log_scale = -1.,
         log_var_add  = -15.,
     )
     upper_bounds = dict(
-        mf_amp       = popt[0]+kappa*perr[0],
-        mf_loc       = popt[1]+kappa*perr[1],
-        mf_log_sig   = np.log(popt[2]+kappa*perr[2]),
-        mf_const     = popt[3]+kappa*perr[3],
+        mf_amp       = 1.2*np.max(Y), #popt[0]+kappa*perr[0],
+        mf_loc       = +1.0, #popt[1]+kappa*perr[1],
+        mf_log_sig   = 2e0, #np.log(popt[2]+kappa*perr[2]),
+        mf_const     = +0.1, #popt[3]+kappa*perr[3],
         gp_log_amp   = 4., # popt[0]/3.+kappa*perr[0],
         gp_log_scale = 1.,
         log_var_add  = 1.5,
