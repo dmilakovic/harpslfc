@@ -263,9 +263,9 @@ def generate_starting_guesses(X, Y, Y_err, n):
     for i in range(1, n):
         new_theta = base_theta.copy()
         # Perturb length-scale log-space by +/- 0.5
-        new_theta['gp_log_scale'] += jnp.random.uniform(-0.5, 0.5)
+        new_theta['gp_log_scale'] += np.random.uniform(-0.5, 0.5)
         # Perturb GP amplitude
-        new_theta['gp_log_amp'] += jnp.random.uniform(-1.0, 1.0)
+        new_theta['gp_log_amp'] += np.random.uniform(-1.0, 1.0)
         guesses.append(new_theta)
         
     return guesses
