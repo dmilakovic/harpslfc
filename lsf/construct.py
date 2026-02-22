@@ -202,54 +202,53 @@ def model_1s_4ray(od,pixl,pixr,x1s,flx1s,err1s,
     logger.info(f"Finished segment {od}/{segm}")
     return out
 
-@ray.remote
-def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
-                **kwargs):
-    """
-    Ray Task: Processes an entire order using JAX vectorization.
-    """
-    if logger is not None:
-        logger = logger.getChild('from_spectrum_2d')
-    else:
-        logger = logging.getLogger(__name__).getChild('from_spectrum_2d')
-    # 1. Prepare uniform stacks for vectorization [1, 2]
-    max_pts = 600 # Buffer size defined in spectrum container [4]
-    batch_X, batch_Y, batch_Yerr = [], [], []
+# @ray.remote
+# def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
+#                 **kwargs):
+#     """
+#     Ray Task: Processes an entire order using JAX vectorization.
+#     """
+#     if logger is not None:
+#         logger = logger.getChild('from_spectrum_2d')
+#     else:
+#         logger = logging.getLogger(__name__).getChild('from_spectrum_2d')
+#     # 1. Prepare uniform stacks for vectorization [1, 2]
+#     max_pts = 600 # Buffer size defined in spectrum container [4]
+#     batch_X, batch_Y, batch_Yerr = [], [], []
     
-    for od, pixl, pixr in order_data_list:
-        x = x2d_ref[od, pixl:pixr]
-        y = flx2d_ref[od, pixl:pixr]
-        e = err2d_ref[od, pixl:pixr]
+#     for od, pixl, pixr in order_data_list:
+#         x = x2d_ref[od, pixl:pixr]
+#         y = flx2d_ref[od, pixl:pixr]
+#         e = err2d_ref[od, pixl:pixr]
         
-        # Pad to max_pts to ensure consistent array shapes for JAX [2]
-        pad_len = max_pts - len(x)
-        batch_X.append(np.pad(x, (0, pad_len), constant_values=np.nan))
-        batch_Y.append(np.pad(y, (0, pad_len), constant_values=0.0))
-        batch_Yerr.append(np.pad(e, (0, pad_len), constant_values=1e9))
+#         # Pad to max_pts to ensure consistent array shapes for JAX [2]
+#         pad_len = max_pts - len(x)
+#         batch_X.append(np.pad(x, (0, pad_len), constant_values=np.nan))
+#         batch_Y.append(np.pad(y, (0, pad_len), constant_values=0.0))
+#         batch_Yerr.append(np.pad(e, (0, pad_len), constant_values=1e9))
 
-    # Convert to JAX arrays for vectorized math [2]
-    X_stack = jnp.array(batch_X)
-    Y_stack = jnp.array(batch_Y)
-    Yerr_stack = jnp.array(batch_Yerr)
+#     # Convert to JAX arrays for vectorized math [2]
+#     X_stack = jnp.array(batch_X)
+#     Y_stack = jnp.array(batch_Y)
+#     Yerr_stack = jnp.array(batch_Yerr)
 
-    # 2. Execution Layer
+#     # 2. Execution Layer
     
-    theta_stack = lsfgp.generate_theta_stack(X_stack, Y_stack, Yerr_stack)
-    bounds_stack = lsfgp.get_bounds_stack(X_stack, Y_stack, Yerr_stack)
+#     theta_stack = lsfgp.generate_theta_stack(X_stack, Y_stack, Yerr_stack)
+#     bounds_stack = lsfgp.get_bounds_stack(X_stack, Y_stack, Yerr_stack)
     
     
-    # Execute the optimization for all segments simultaneously
-    best_thetas = lsfgp.train_LSF_batch(X_stack, Y_stack, Yerr_stack, 
-                                  theta_stack, bounds_stack)
+#     # Execute the optimization for all segments simultaneously
+#     best_thetas = lsfgp.train_LSF_batch(X_stack, Y_stack, Yerr_stack, 
+#                                   theta_stack, bounds_stack)
     
-    for i, (od, pixl, pixr) in enumerate(order_data_list)):
+#     for i, (od, pixl, pixr) in enumerate(order_data_list):
         
-    results = [gp_aux.format_as_lsf1s(best_thetas[i]) ]
-    return results
+#         results = [gp_aux.format_as_lsf1s(best_thetas[i]) ]
+#     return results
 
 
         
-    return results
 
 #@profile
 def stack_segment(x_star,f_star,x1s,flx1s,err1s,minima_x,scale='pixel'):
