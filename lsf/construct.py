@@ -371,6 +371,7 @@ def model_1d(order_data_list, x2d_ref, flx2d_ref, err2d_ref, **kwargs):
         results.append(lsf_output)
     return results
 
+@profile
 def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
              model_scatter=False,
              remove_outliers=True,
