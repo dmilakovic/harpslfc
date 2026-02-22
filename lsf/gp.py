@@ -113,9 +113,12 @@ def run_lsf_optimization_task(theta_start, X, Y, Y_err, scatter, bounds):
     
 def run_lsf_optimization_local(theta_start, X, Y, Y_err, scatter, bounds):
     """Local helper to run optimization without Ray .remote overhead."""
-    lbfgsb = jaxopt.ScipyBoundedMinimize(
-        fun=partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter),
-        method="l-bfgs-b"
+    # lbfgsb = jaxopt.ScipyBoundedMinimize(
+    #     fun=partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter),
+    #     method="l-bfgs-b"
+    # )
+    lbfgsb = jaxopt.LBFGSB(
+        fun=partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter)
     )
     try:
         solution = lbfgsb.run(theta_start, bounds=bounds)
