@@ -137,7 +137,11 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     
     # 2. Execute optimizations serially on the current worker
     results = vectorized_run_lsf_optimization_local(starts,
-                                                    X, Y, Y_err, bounds)
+                                                    X, 
+                                                    Y, 
+                                                    Y_err,
+                                                    scatter,
+                                                    bounds)
     # results = []
     # for s in starts:
     #     res = run_lsf_optimization_local(s, X, Y, Y_err, scatter, bounds)
