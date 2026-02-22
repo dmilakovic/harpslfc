@@ -139,6 +139,9 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     starts_batched = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *starts)
     print('bounds')
     print(bounds)
+    
+    print('starts_batched')
+    print(starts_batched)
     # 2. Execute optimizations serially on the current worker
     results = vectorized_run_lsf_optimization_local(starts_batched,
                                                     X, 
