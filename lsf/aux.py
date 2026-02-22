@@ -33,6 +33,7 @@ import multiprocessing
 import copy
 from   functools import partial
 import traceback
+import ray
 
 from scipy import interpolate
 from scipy.optimize import brentq
@@ -877,10 +878,25 @@ def read_outfile4solve(out_filepath,version,scale):
         nbo,npix = np.shape(flx2d)
         x2d   = np.vstack([np.arange(npix) for od in range(nbo)])
     return x2d,flx2d,err2d,env2d,bkg2d,linelist
-        
+ 
+
+@ray.remote
+def solve_1d(indices, linelist, x2d, flx2d, err2d, LSF2d_nm, **kwargs):
+    """
+    Ray Task: Processes all lines within a specific echelle order.
+    'indices' is a 1D array of row indices in the linelist for one order.
+    """
+    results = []
+    # Process lines in this batch serially to avoid nested deadlocks
+    for idx in indices:
+        # solve_line handles its own logging if logger=None
+        res = solve_line(idx, linelist, x2d, flx2d, err2d, LSF2d_nm, **kwargs)
+        results.append(res)
+    return results
+       
 def solve(out_filepath,lsf_filepath,iteration,order,force_version=None,
           model_scatter=False,interpolate=False,scale=['pixel','velocity'],
-          npars = None,
+          npars = None,sOrder=None,
           subbkg=hs.subbkg,divenv=hs.divenv,save2fits=True,logger=None):
     from fitsio import FITS
     from harps.lsf.container import LSF2d
@@ -969,7 +985,7 @@ def solve(out_filepath,lsf_filepath,iteration,order,force_version=None,
     io.make_extension(out_filepath, 'model_lsf', version, flx2d.shape)
     
     nbo,npix = np.shape(flx2d)
-    orders = specfunc.prepare_orders(order, nbo, sOrder=39, eOrder=None)
+    orders = specfunc.prepare_orders(order, nbo, sOrder=sOrder, eOrder=None)
     
     # firstrow = int(1e6)
     cut_ = [np.ravel(np.where(linelist['order']==od)[0]) for od in orders]
@@ -982,56 +998,166 @@ def solve(out_filepath,lsf_filepath,iteration,order,force_version=None,
     # lines = (line for line in linelist)
     time_start = time.time()
     
-    option = 2
-    if 'pixel' in scale:
-        partial_function_pix = partial(solve_line,
-                                       linelist=linelist,
-                                       x2d=x2d,
-                                       flx2d=flx_norm,
-                                       err2d=err_norm,
-                                       LSF2d_nm=LSF2d_nm_pix,
-                                       ftype='lsf',
-                                       scale='pixel',
-                                       interpolate=interpolate,
-                                       npars=npars)
-        if option==1:
-            with multiprocessing.Pool() as pool:
-                results = pool.map(partial_function_pix, cut)
-        elif option==2:
-            results = bulk_fit(partial_function_pix)
-        print(np.shape(np.asarray(results,dtype="object")))
-        new_llist, models = np.transpose(np.asarray(results,dtype="object"))
     
-        linelist[cut] = new_llist
-    # delete these lines later. These were put in to skip re-doing the entire
-    # calculations for pixel when also creating velocity models
-    # with FITS(out_filepath,'r') as hdul:
-        # linelist = hdul['linelist',version].read()
-    # fit for wavelength positions
-    if 'velocity' in scale:
-        lsf_wavesol = ws.comb_dispersion(linelist, version=701, fittype='lsf', 
-                                         npix=npix, 
-                                         nord=nbo,
-                                         ) 
+    option = 2
+    if option<3:
+        if 'pixel' in scale:
+            partial_function_pix = partial(solve_line,
+                                           linelist=linelist,
+                                           x2d=x2d,
+                                           flx2d=flx_norm,
+                                           err2d=err_norm,
+                                           LSF2d_nm=LSF2d_nm_pix,
+                                           ftype='lsf',
+                                           scale='pixel',
+                                           interpolate=interpolate,
+                                           npars=npars)
+            if option==1:
+                with multiprocessing.Pool() as pool:
+                    results = pool.map(partial_function_pix, cut)
+            elif option==2:
+                results = bulk_fit(partial_function_pix)
+            print(np.shape(np.asarray(results,dtype="object")))
+            new_llist, models = np.transpose(np.asarray(results,dtype="object"))
         
-        partial_function_vel= partial(solve_line,
-                                       linelist=linelist,
-                                       x2d=lsf_wavesol,
-                                       flx2d=flx_norm,
-                                       err2d=err_norm,
-                                       LSF2d_nm=LSF2d_nm_vel,
-                                       ftype='lsf',
-                                       scale='velocity',
-                                       interpolate=interpolate,
-                                       npars=npars)
+            linelist[cut] = new_llist
+        # delete these lines later. These were put in to skip re-doing the entire
+        # calculations for pixel when also creating velocity models
+        # with FITS(out_filepath,'r') as hdul:
+            # linelist = hdul['linelist',version].read()
+        # fit for wavelength positions
+        if 'velocity' in scale:
+            lsf_wavesol = ws.comb_dispersion(linelist, version=701, fittype='lsf', 
+                                             npix=npix, 
+                                             nord=nbo,
+                                             ) 
+            
+            partial_function_vel= partial(solve_line,
+                                           linelist=linelist,
+                                           x2d=lsf_wavesol,
+                                           flx2d=flx_norm,
+                                           err2d=err_norm,
+                                           LSF2d_nm=LSF2d_nm_vel,
+                                           ftype='lsf',
+                                           scale='velocity',
+                                           interpolate=interpolate,
+                                           npars=npars)
+            
+            if option==1:
+                with multiprocessing.Pool() as pool:
+                    results = pool.map(partial_function_pix, cut)
+            elif option==2:
+                results = bulk_fit(partial_function_vel)
+            new_llist, models = np.transpose(np.asarray(results,dtype="object"))
+            linelist[cut] = new_llist
+    else:
+        logger.info('Starting distributed line solving via Ray')
+        if not ray.is_initialized():
+            ray.init()
         
-        if option==1:
-            with multiprocessing.Pool() as pool:
-                results = pool.map(partial_function_pix, cut)
-        elif option==2:
-            results = bulk_fit(partial_function_vel)
-        new_llist, models = np.transpose(np.asarray(results,dtype="object"))
-        linelist[cut] = new_llist
+        # 1. Place shared data into the Object Store [2, 3]
+        x2d_ref = ray.put(x2d)
+        flx2d_ref = ray.put(flx_norm)
+        err2d_ref = ray.put(err_norm)
+        ll_ref  = ray.put(linelist)
+        # Handle the LSF containers separately for pixel and velocity
+        LSF2d_nm_pix_ref = ray.put(LSF2d_nm_pix)
+        LSF2d_nm_vel_ref = ray.put(LSF2d_nm_vel) if 'velocity' in scale else None
+    
+        # 2. Launch Batched Ray tasks [4, 5]
+        # We use 'cut_' which is already grouped by echelle order [1]
+        if 'pixel' in scale:
+            futures_pix = [
+                solve_1d.remote(order_idx_list, 
+                                ll_ref, 
+                                x2d_ref, 
+                                flx2d_ref, 
+                                err2d_ref, 
+                                LSF2d_nm_pix_ref,
+                                ftype='lsf', scale='pixel', 
+                                interpolate=interpolate, npars=npars)
+                for order_idx_list in cut_
+            ]
+            
+            # Monitor progress using ray.wait [6]
+            work_len = len(futures_pix)
+            time_start = time.time()
+            finished_count = 0
+            unready = futures
+            results_ordered = [None] * work_len
+            # Map the futures to their original iterator indices to preserve order
+            future_to_index = {f: i for i, f in enumerate(futures_pix)}
+
+            while unready:
+                # Wait for at least one task to finish (timeout=1s to refresh time display)
+                ready, unready = ray.wait(unready, num_returns=1, timeout=1.0)
+                
+                # Update stats
+                finished_count = work_len - len(unready)
+                progress = finished_count / work_len
+                time_elapsed = time.time() - time_start
+                
+                progress_bar.update(
+                    progress, 
+                    name=f'Fitting lines in pixel space',
+                    time=time_elapsed,
+                    logger=None
+                )
+            
+            # Retrieve and flatten results [6]
+            batched_results = ray.get(futures_pix)
+            results = [line for order_res in batched_results for line in order_res]
+            new_llist, models = np.transpose(np.asarray(results, dtype="object"))
+            linelist[cut] = new_llist
+    
+        if 'velocity' in scale:
+            lsf_wavesol = ws.comb_dispersion(linelist, version=700, fittype='lsf', 
+                                             npix=npix, 
+                                             nord=nbo,
+                                             ) 
+            wav2d_ref = ray.put(lsf_wavesol)
+            futures_wav = [
+                solve_1d.remote(order_idx_list, 
+                                ll_ref, 
+                                wav2d_ref,
+                                flx2d_ref, 
+                                err2d_ref, 
+                                LSF2d_nm_vel_ref,
+                                ftype='lsf', scale='velocity', 
+                                interpolate=interpolate, npars=npars)
+                for order_idx_list in cut_
+            ]
+            
+            # Monitor progress using ray.wait [6]
+            work_len = len(futures_wav)
+            time_start = time.time()
+            finished_count = 0
+            unready = futures
+            results_ordered = [None] * work_len
+            # Map the futures to their original iterator indices to preserve order
+            future_to_index = {f: i for i, f in enumerate(futures_wav)}
+
+            while unready:
+                # Wait for at least one task to finish (timeout=1s to refresh time display)
+                ready, unready = ray.wait(unready, num_returns=1, timeout=1.0)
+                
+                # Update stats
+                finished_count = work_len - len(unready)
+                progress = finished_count / work_len
+                time_elapsed = time.time() - time_start
+                
+                progress_bar.update(
+                    progress, 
+                    name=f'Fitting lines in pixel space',
+                    time=time_elapsed,
+                    logger=None
+                )
+            
+            # Retrieve and flatten results [6]
+            batched_results = ray.get(futures_wav)
+            results = [line for order_res in batched_results for line in order_res]
+            new_llist, models = np.transpose(np.asarray(results, dtype="object"))
+            linelist[cut] = new_llist
     worktime = (time.time() - time_start)
     h, m, s  = progress_bar.get_time(worktime)
     logger.info(f"Total time elapsed : {h:02d}h {m:02d}m {s:02d}s")
@@ -1110,8 +1236,8 @@ def solve_line(i,linelist,x2d,flx2d,err2d,LSF2d_nm,ftype='gauss',scale='pix',
     success = False
     pars = "None"
     chisq = np.nan
-    
-    if LSF1d is None or len(LSF1d) == 0 or np.any(LSF1d.values['y']):
+    print(LSF1d)
+    if LSF1d is None or len(LSF1d) == 0:
         logger.warning(f"Order {od}: No valid LSF models found. Skipping line {i}.")
         # Return a failed line result to stay consistent with the bulk_fit loop
         line[f'lsf_{scl}'] = np.nan
@@ -1124,7 +1250,7 @@ def solve_line(i,linelist,x2d,flx2d,err2d,LSF2d_nm,ftype='gauss',scale='pix',
         output = hlsfit.line(
             x1l,flx1l,err1l,
             bary=bary,
-            LSF1d_obj = LSF1d, # Use forward reference for LSF1d if defined later or imported
+            LSF1d_obj = LSF1d,  
             scale = scale,
             npars = 3, # Default to 3 parameters (amp, cen, wid)
             weight = True,
