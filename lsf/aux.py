@@ -1243,7 +1243,8 @@ def solve_line(i,linelist,x2d,flx2d,err2d,LSF2d_nm,ftype='gauss',scale='pix',
         line[f'lsf_{scl}'] = np.nan
         return line, np.zeros_like(flx1l)
     try:
-        logger.info(LSF1d.interpolate_lsf(bary))
+        logger.info(f"Line {i}, barycentre {bary}, LSF for this order exists")
+        logger.info("interpolate LSF", LSF1d.interpolate_lsf(bary))
         # output = hfit.lsf(x1l,flx1l,bkg1l,err1l,lsf1d,
         #                   interpolate=interpolate,
         #                   output_model=True)
