@@ -212,24 +212,24 @@ def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
     else:
         logger = logging.getLogger(__name__).getChild('from_spectrum_2d')
     # 1. Prepare uniform stacks for vectorization [1, 2]
-    max_pts = 600 # Buffer size defined in spectrum container [4]
-    batch_X, batch_Y, batch_Yerr = [], [], []
+    # max_pts = 600 # Buffer size defined in spectrum container [4]
+    # batch_X, batch_Y, batch_Yerr = [], [], []
     
-    for od, pixl, pixr in order_data_list:
-        x = x2d_ref[od, pixl:pixr]
-        y = flx2d_ref[od, pixl:pixr]
-        e = err2d_ref[od, pixl:pixr]
+    # for od, pixl, pixr in order_data_list:
+    #     x = x2d_ref[od, pixl:pixr]
+    #     y = flx2d_ref[od, pixl:pixr]
+    #     e = err2d_ref[od, pixl:pixr]
         
-        # Pad to max_pts to ensure consistent array shapes for JAX [2]
-        pad_len = max_pts - len(x)
-        batch_X.append(np.pad(x, (0, pad_len), constant_values=np.nan))
-        batch_Y.append(np.pad(y, (0, pad_len), constant_values=0.0))
-        batch_Yerr.append(np.pad(e, (0, pad_len), constant_values=1e9))
+    #     # Pad to max_pts to ensure consistent array shapes for JAX [2]
+    #     pad_len = max_pts - len(x)
+    #     batch_X.append(np.pad(x, (0, pad_len), constant_values=np.nan))
+    #     batch_Y.append(np.pad(y, (0, pad_len), constant_values=0.0))
+    #     batch_Yerr.append(np.pad(e, (0, pad_len), constant_values=1e9))
 
-    # Convert to JAX arrays for vectorized math [2]
-    X_stack = jnp.array(batch_X)
-    Y_stack = jnp.array(batch_Y)
-    Yerr_stack = jnp.array(batch_Yerr)
+    # # Convert to JAX arrays for vectorized math [2]
+    # X_stack = jnp.array(batch_X)
+    # Y_stack = jnp.array(batch_Y)
+    # Yerr_stack = jnp.array(batch_Yerr)
 
     # 2. Execution Layer
     # While the iterative centering [5] is per-segment, 
@@ -237,12 +237,13 @@ def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
     results = []
     for i in range(len(order_data_list)):
         od, pixl, pixr = order_data_list[i]
+        logger.info(f'Order = {od}\t pixl={pixl}\t pixr={pixr}')
         # Call the single-segment solver [6]
         # Independence is maintained while Ray manages the batch distribution
         res = model_1s_4ray(od,pixl,pixr,
-                            X_stack[od,pixl:pixr],
-                            Y_stack[od,pixl:pixr],
-                            Yerr_stack[od,pixl:pixr],
+                            x2d_ref[od,pixl:pixr],
+                            flx2d_ref[od,pixl:pixr],
+                            err2d_ref[od,pixl:pixr],
                             logger=logger,
                         **kwargs)
         logger.info(f"Finished {od}/{pixl}:{pixr}")
