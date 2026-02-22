@@ -246,6 +246,7 @@ def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
                             Yerr_stack[od,pixl:pixr],
                             logger=logger,
                         **kwargs)
+        print(res['order'], res['ledge'], res['redge'])
         logger.info(f"Finished {od}/{pixl}:{pixr}")
         results.append(res)
         
