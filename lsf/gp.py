@@ -121,8 +121,8 @@ def run_lsf_optimization_local(theta_start, X, Y, Y_err, scatter, bounds):
         fun=partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter)
     )
     try:
-        solution = lbfgsb.run(theta_start, bounds=bounds)
-        return solution.params, solution.state.fun_val
+        params, state = lbfgsb.run(theta_start, bounds=bounds)
+        return params, state.fun_val
     except Exception as e:
         print(f"EXCEPTION {e}")
         return None, jnp.inf
@@ -140,11 +140,11 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
     bounds = get_lsf_bounds(X, Y, Y_err)
     
     starts_batched = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *starts)
-    print('bounds')
-    print(bounds)
+    # print('bounds')
+    # print(bounds)
     
-    print('starts_batched')
-    print(starts_batched)
+    # print('starts_batched')
+    # print(starts_batched)
     # 2. Execute optimizations serially on the current worker
     results = vectorized_run_lsf_optimization_local(starts_batched,
                                                     X, 
