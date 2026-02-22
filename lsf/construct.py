@@ -182,6 +182,7 @@ def model_1s_4ray(od,pixl,pixr,x1s,flx1s,err1s,
     # except:
         # out = None
     logger.info("Out is None", out is None)
+    print("Out is None: ", out is None, pixl, pixr, od, segm)
     if out is not None:
         logger.info(f"{out.dtype=}")
         out['ledge'] = pixl
@@ -248,7 +249,7 @@ def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
                         **kwargs)
         print(res['order'], res['ledge'], res['redge'])
         logger.info(f"Finished {od}/{pixl}:{pixr}")
-        results.append(res)
+        results.append(res[0])
         
     return results
 
