@@ -930,7 +930,8 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
         batched_results = ray.get(futures)
         
     results = [seg for order_list in batched_results for seg in order_list]
-    print(type(results))
+    logger.info(f'{len(results)=}')
+    logger.info(f'{results[0].dtype}')
     for i,lsf1s_out in enumerate(results):
         # if lsf1s_out[0] is None:
         if isinstance(lsf1s_out, tuple) and lsf1s_out is None:
