@@ -37,12 +37,15 @@ from logging.handlers import QueueHandler, QueueListener
 
 import ray
 
+
 def initialize_ray(address=None):
     if ray.is_initialized():
         return
     if address:
         # Connects to an existing HPC cluster or remote head node
-        ray.init(address=address)
+        ray.init(address=address,
+                 include_dashboard=True,
+                 _system_config={"enable_timeline": True})
     else:
         # Starts a local cluster using all available cores on your laptop/remote machine
         ray.init()
@@ -371,7 +374,7 @@ def model_1d(order_data_list, x2d_ref, flx2d_ref, err2d_ref, **kwargs):
         results.append(lsf_output)
     return results
 
-@profile
+# @profile
 def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
              model_scatter=False,
              remove_outliers=True,

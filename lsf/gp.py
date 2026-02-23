@@ -122,7 +122,9 @@ def run_lsf_optimization_local(theta_start, X, Y, Y_err, scatter, bounds):
     )
     try:
         params, state = lbfgsb.run(theta_start, bounds=bounds)
-        return params, state.fun_val
+        
+        # return params, state.fun_val
+        return params, loss_LSF(params, X, Y, Y_err, scatter)
     except Exception as e:
         print(f"EXCEPTION {e}")
         return None, jnp.inf
@@ -152,22 +154,36 @@ def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
                                                     Y_err,
                                                     scatter,
                                                     bounds)
+    params_batched, losses_batched = results
+    best_index = jnp.argmin(losses_batched)
+    best_params = jax.tree_util.tree_map(lambda x: x[best_index], params_batched)
+    best_loss = losses_batched[best_index]
+    
+    return best_params, best_loss
     # results = []
     # for s in starts:
     #     res = run_lsf_optimization_local(s, X, Y, Y_err, scatter, bounds)
     #     results.append(res)
     
     # 3. Filter failures and choose the best log-likelihood [3, 4]
-    valid_results = [res for res in results if res is not None]
-    print('valid results')
-    print(valid_results)
-    if not valid_results:
-        raise RuntimeError("All hyperparameter optimization starts failed.")
+    # valid_results = [res for res in results if res is not None]
+    # params_batched, losses_batched = results
+    # valid_results = [
+    #     (jax.tree_util.tree_map(lambda x: x[i], params_batched),
+    #      losses_batched[i])
+    #     for i in range(losses_batched.shape[0])
+    #     if not jnp.isinf(losses_batched[i])
+    # ]
         
-    best_params = min(valid_results, key=lambda x: x[1])
-    print('best params')
-    print(best_params)
-    return best_params
+    # print('valid results')
+    # print(valid_results)
+    # if not valid_results:
+    #     raise RuntimeError("All hyperparameter optimization starts failed.")
+        
+    # best_params = min(valid_results, key=lambda x: x[1])
+    # print('best params')
+    # print(best_params)
+    # return best_params
     
 
 
