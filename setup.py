@@ -15,7 +15,8 @@ setup(
     version='2.0', 
     author='Dinko Milakovic',
     author_email='dinko@milakovic.net',
-  
+  	packages=['harps'],
+    package_dir={'harps': '.'},
     # Use one of the below approach to define package and/or module names:
   
     #if there are only handful of modules placed in root directory, and no packages/directories exist then can use below syntax
@@ -25,8 +26,8 @@ setup(
 #     packages=['<list of name of packages>'], #importing is like: from package1 import mod2, or import package1.mod2 as m2
   
     #this approach automatically finds out all directories (packages) - those must contain a file named __init__.py (can be empty)
-    packages=find_packages(), #include/exclude arguments take * as wildcard, . for any sub-package names
+    #packages=find_packages(), #include/exclude arguments take * as wildcard, . for any sub-package names
     install_requires=['numpy', 'scipy','fitsio', 'jax','jaxlib','jaxopt',
                       'tinygp',
-                      'astropy','matplotlib']
+                      'astropy','matplotlib','scikit-learn', 'ray']
 )

@@ -17,8 +17,8 @@ from collections import Counter
 from matplotlib.lines import Line2D
 from sklearn.linear_model import RANSACRegressor, HuberRegressor
 import scipy
-from scipy.signal import welch, windows, convolve, wiener, nuttall # windows, convolve used in placeholders
-
+from scipy.signal import welch, windows, convolve, wiener # windows, convolve used in placeholders
+from scipy.signal.windows import nuttall
 
 __all__ = [
         "get_window",
