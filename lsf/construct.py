@@ -41,15 +41,18 @@ import ray
 def initialize_ray(address=None):
     if ray.is_initialized():
         return
+    runtime_env = {"env_vars": {"RAY_WORKER_PROCESS_START_TYPE": "spawn"}}
     if address:
         # Connects to an existing HPC cluster or remote head node
         ray.init(address=address,
                  include_dashboard=True,
-                 _system_config={"enable_timeline": True})
+                 _system_config={"enable_timeline": True},
+                 runtime_env=runtime_env)
     else:
         # Starts a local cluster using all available cores on your laptop/remote machine
-        ray.init()
+        ray.init(runtime_env=runtime_env)
 
+initialize_ray()
 
 def model_1si(i,seglims,x2d,flx2d,err2d,numiter=5,filter=None,model_scatter=False,
                     plot=False,save_plot=False,metadata=None,
