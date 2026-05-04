@@ -7,7 +7,7 @@ Created on Tue Jan 31 15:39:20 2023
 """
 from fitsio import FITS
 import numpy as np
-import jax.numpy as jnp
+# import jax.numpy as jnp
 import harps.functions as hf
 import harps.peakdetect as pkd
 import harps.lsf.aux as aux
@@ -362,6 +362,11 @@ def model_1d(order_data_list, x2d_ref, flx2d_ref, err2d_ref, metadata, **kwargs)
     """
     Ray Task: Processes a batch of segments
     """
+    
+    import os
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    import jax.numpy as jnp  # now safe to import
+    
     results = []
     for od, pixl, pixr in order_data_list:
         # Extract data for the specific segment
@@ -567,6 +572,7 @@ def construct_tinygp(x,y,y_err,plot=False,
         DESCRIPTION.
 
     '''
+    import jax.numpy as jnp
     X        = jnp.array(x)
     Y        = jnp.array(y)
     Y_err    = jnp.array(y_err)
@@ -920,7 +926,7 @@ def from_outpath_2d(outpath,orders,iteration,scale='pixel',iter_center=5,
                   numseg=16,minpix=None,maxpix=None,filter=None,
                   model_scatter=True,save_fits=True,clobber=False,
                   plot=False,save_plot=False,force_version=None,
-                  interpolate=False,update_linelist=True,logger=None):
+                  interpolate=False,update_linelist=True,logger=None,**kwargs):
     assert scale in ['pixel','velocity']
     assert iteration>0
     
@@ -1085,7 +1091,7 @@ def from_outpath_2d(outpath,orders,iteration,scale='pixel',iter_center=5,
     if save_fits:
         
         # Save GP parameters and data
-        lsf_filepath = hio.get_fits_path('lsf',spec.filepath)
+        lsf_filepath = hio.get_fits_path('lsf',outpath)
         lio.write_lsf_to_fits(lsf2d, lsf_filepath, f"{scale}_gp",
                               version=version,
                               clobber=clobber)   
@@ -1153,6 +1159,7 @@ def numerical_models(lsf1d_gp,xrange=(-6,6),subpix=50):
 
 
 def evaluate_GP(GP,y_data,x_test):
+    import jax.numpy as jnp
     _, cond = GP.condition(y_data,X_test=x_test)
     mean = cond.mean
     var  = jnp.sqrt(cond.variance)
@@ -1292,7 +1299,7 @@ def get_most_likely_lsf2d(lsfpath,scale,nbo=72,nseg=16):
 
 def save_most_likely(lsf_filepath,scale,nbo=72,nseg=16,save_filepath=None,
                      clobber=False):
-    most_likely_lsf2d = get_most_likely_lsf2d(lsf_filepath,scale,nbo=nbo,nseg=sneg)
+    most_likely_lsf2d = get_most_likely_lsf2d(lsf_filepath,scale,nbo=nbo,nseg=nseg)
     
     save_filepath = save_filepath if save_filepath is not None else lsf_filepath
     lio.write_lsf_to_fits(most_likely_lsf2d, save_filepath, f"{scale}_gp",
