@@ -372,7 +372,7 @@ def train_LSF_tinygp(X,Y,Y_err,scatter=None, return_only_init=False):
                                                       Y_err=Y_err,
                                                       scatter=scatter),
                                           method="l-bfgs-b")
-    solution = lbfgsb.run(jax.tree_map(jnp.asarray, theta), bounds=bounds)
+    solution = lbfgsb.run(jax.tree.map(jnp.asarray, theta), bounds=bounds)
     
     # solver = jaxopt.GradientDescent(fun=partial(loss_LSF,
     #                                           X=X,
@@ -575,7 +575,7 @@ def train_scatter_tinygp(X,Y,Y_err,theta_lsf,minpts=15,
                                                       Y=log_var,
                                                       Y_err=err_log_var),
                                           method="l-bfgs-b")
-    solution = lbfgsb.run(jax.tree_map(jnp.asarray, theta), bounds=bounds)
+    solution = lbfgsb.run(jax.tree.map(jnp.asarray, theta), bounds=bounds)
     # solver = jaxopt.GradientDescent(fun=partial(loss_scatter,
     #                                           X=x_array,
     #                                           Y=log_var,

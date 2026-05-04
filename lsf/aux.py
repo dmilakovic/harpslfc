@@ -699,12 +699,17 @@ def get_samvar_variance(x,*args,**kwargs):
         DESCRIPTION.
 
     '''
+    # Handle NaNs in JAX
+    x = x[~jnp.isnan(x)]
     
     n        = len(x)
-    mom4_sam = stats.moment(x,moment=4,nan_policy='omit') 
+    mean     = jnp.mean(x)
+    mom4_sam = jnp.mean((x - mean)**4)
+    
+    # mom4_sam = stats.moment(x,moment=4,nan_policy='omit') 
     # diff     = x-jnp.nanmean(x)
     # mom4_sam = 1./n * jnp.nansum(expt_rec(diff,4))
-    var      = jnp.nanvar(x)
+    var      = jnp.var(x)
     
     return mom4_sam/n - var**2 * (n-3)/(n*(n-1))
 

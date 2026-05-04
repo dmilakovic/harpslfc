@@ -355,7 +355,7 @@ def get_initial_guess(x1s,flx1s,err1s,minima_x):
     return minima_x, x_star_0, f_star_0
 
 @ray.remote
-def model_1d(order_data_list, x2d_ref, flx2d_ref, err2d_ref, **kwargs):
+def model_1d(order_data_list, x2d_ref, flx2d_ref, err2d_ref, metadata, **kwargs):
     """
     Ray Task: Processes a batch of segments
     """
@@ -365,9 +365,9 @@ def model_1d(order_data_list, x2d_ref, flx2d_ref, err2d_ref, **kwargs):
         x1s = np.ravel(x2d_ref[od, pixl:pixr])
         flx1s = np.ravel(flx2d_ref[od, pixl:pixr])
         err1s = np.ravel(err2d_ref[od, pixl:pixr])
-        
+        metadata.update({'order':od, 'ledge':pixl, 'redge':pixr})
         # Call the working iterative logic
-        lsf_output = model_1s(x1s, flx1s, err1s, **kwargs)
+        lsf_output = model_1s(x1s, flx1s, err1s, metadata=metadata, **kwargs)
         
         if lsf_output is not None:
             lsf_output.update({'order': od, 'ledge': pixl, 'redge': pixr})
@@ -519,9 +519,11 @@ def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
         logger.warning(f'Chisq above limit ({chisqlimit}): {chisq}')
     
     # save the total number of points used
-    lsf1s['numlines'] = len(pix1s_j)
-    lsf1s['shift'] = shift
-    return lsf1s
+    # print('BEFORE SAVING SOME INFORMATION TO DICT', type(lsf1s))
+    dictionary_j['numlines'] = len(pix1s_j)
+    dictionary_j['shift'] = shift
+    # print('BEFORE RETURN', type(dictionary_j))
+    return dictionary_j
 
 
 def construct_tinygp(x,y,y_err,plot=False,
@@ -835,17 +837,17 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
     
     order_groups = dict(order_groups)
     
-    print([list(segments) for od, segments in order_groups.items()])
+    # print([list(segments) for od, segments in order_groups.items()])
     futures = [
             model_1d.remote(
                 list(segments), 
                 x2d_ref, flx2d_ref, err2d_ref, 
+                metadata=metadata,
                 numiter=iter_center, 
                 filter=filter,
                 model_scatter=model_scatter,
                 plot=plot,
                 save_plot=save_plot,
-                metadata=metadata,
                 logger=logger
                 ) 
             for od, segments in order_groups.items()

@@ -596,9 +596,11 @@ def plot_solution(pix1s,flx1s,err1s,params_LSF,scatter,metadata,shift,
         figmetadata=dict(
             Author = 'Dinko Milakovic',
             Creator = "harps.lsf.plot",
-            Title = f"Order/segment = {metadata['order']}/{metadata['segment']} "+\
+            Title = f"Order = {metadata['order']}; "+\
+                f"pixl = {metadata['ledge']}; "+\
+                f"pixr = {metadata['redge']}; "+\
                 f"Scale = {metadata['scale']}; "+\
-                f"Model scatter = {metadata['model_scatter']} " +\
+                f"Model scatter = {metadata['model_scatter']}; " +\
                 f"Iteration = {metadata['iteration']}",
             
             )
