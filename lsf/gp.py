@@ -25,36 +25,40 @@ from . import gp_aux
 
 def loss_LSF(params: dict,
              x    : jnp.ndarray,
-             mask : jnp.ndarray,   # NEW: 1=real, 0=padded
+             # mask : jnp.ndarray,   # NEW: 1=real, 0=padded
              y    : jnp.ndarray,
              yerr : jnp.ndarray,
-             scatter: bool = None,
+             use_yerr : bool = False,
+             scatter : list = [],
+             use_scatter: bool = False,
              ) -> jnp.ndarray:
     """
     Negative log marginal likelihood for the LSF GP model.
     Padded points are excluded via mask (their err is 1e9, so they
     contribute negligibly even without masking — mask is a safety net).
     """
-    gp = build_LSF_GP(params,x,mask, y,yerr,scatter)
+    gp = build_LSF_GP(params,x,yerr,use_yerr, scatter, use_scatter)
     return -gp.log_probability(y)
 
 def loss_scatter(params: dict,
                  x    : jnp.ndarray,
-                 mask : jnp.ndarray,   # NEW: 1=real, 0=padded
+                 # mask : jnp.ndarray,   # NEW: 1=real, 0=padded
                  y    : jnp.ndarray,
                  yerr : jnp.ndarray,
                  ) -> jnp.ndarray:
     """Negative log marginal likelihood including a scatter (noise floor) term."""
-    gp = build_scatter_GP(params,x, yerr, mask)
+    gp = build_scatter_GP(params,x, yerr)
     return -gp.log_probability(y)
 
 def _run_one_start(params0 : dict,
                    x       : jnp.ndarray,
                    y       : jnp.ndarray,
                    yerr    : jnp.ndarray,
+                   use_yerr: bool,
                    mask    : jnp.ndarray,
                    bounds  : tuple[dict, dict],
-                   loss_fn : callable,
+                   scatter : list = [],
+                   use_scatter : bool = False,
                    maxiter : int = 300
                    ) -> tuple[dict, jnp.ndarray]:
     """
@@ -65,13 +69,21 @@ def _run_one_start(params0 : dict,
     # bounds = generate_bounds_batch(x, y, yerr)
     
     solver = jaxopt.LBFGSB(
-        fun     = loss_fn,
+        fun = functools.partial(
+                    loss_LSF,
+                    x = x, 
+                    y = y,
+                    yerr = yerr,
+                    use_yerr = use_yerr,
+                    scatter = scatter,
+                    use_scatter = use_scatter),
         maxiter = maxiter,
         tol     = 1e-5,
     )
-    result = solver.run(params0, bounds=bounds,
-                        x=x, y=y, yerr=yerr, mask=mask)
-    return result.params, result.state.value
+    result = solver.run(params0, bounds=bounds)
+    # Evaluate loss at solution using the unchanged loss_LSF
+    final_loss = loss_LSF(result.params, x, y, yerr, use_yerr, scatter, use_scatter)
+    return result.params, final_loss
 
 def generate_starts_batch(x_batch    : jnp.ndarray,   # (N_seg, max_len)
                           flx_batch  : jnp.ndarray,
@@ -151,474 +163,242 @@ def generate_bounds_batch(x_batch    : jnp.ndarray,   # (N_seg, max_len)
 
 # ── Multi-start optimiser for one segment ────────────────────────────────────
 
-def fit_one_segment(x        : jnp.ndarray,   # shape (max_len,)
-                    y        : jnp.ndarray,   # shape (max_len,)
-                    yerr     : jnp.ndarray,   # shape (max_len,)
-                    mask     : jnp.ndarray,   # shape (max_len,)
-                    starts   : dict,          # each leaf shape (num_starts,)
-                    bounds   : tuple[dict, dict],
-                    loss_fn  : callable,
+def fit_one_segment(x        : jnp.ndarray,   # (max_len,)
+                    y        : jnp.ndarray,
+                    yerr    : jnp.ndarray,
+                    mask     : jnp.ndarray,    # 1=real data, 0=padded
+                    starts   : dict,           # each leaf (num_starts,)
+                    bounds   : tuple,          # (lower_dict, upper_dict)
+                    scatter  = None,
+                    numiter  : int = 5,
                     maxiter  : int = 300,
-                    ) -> tuple[dict, jnp.ndarray]:
+                    delta_lim: float = 1e-3,
+                    shift_lim: float = 1e-3,
+                    ) -> tuple[dict, jnp.ndarray, jnp.ndarray]:
     """
-    Multi-start L-BFGS-B optimisation for a single segment.
+    Full iterative GP fit + recentering for one segment, mirroring model_1s.
 
-    Vmaps _run_one_start over the num_starts axis of `starts`, then picks
-    the result with the lowest loss.
-
-    Designed to be called via jax.vmap over the segment axis.
+    Uses:
+      - loss_LSF unchanged (passed through to _run_one_start)
+      - build_LSF_GP via estimate_centre_anderson and get_residuals
+      - lax.while_loop so the entire loop is JAX-traceable and vmappable
 
     Returns
     -------
-    best_params : dict  — optimal GP hyperparameters
-    best_loss   : scalar jnp.ndarray
+    best_params : dict   — final GP hyperparameters
+    final_shift : scalar — total x shift applied
+    final_mask  : array  — final good-point mask
     """
-    # vmap over starting points — inner parallelism
-    run_all_starts = jax.vmap(
-        functools.partial(_run_one_start,
-                          x=x, y=y, yerr=yerr, mask=mask,
-                          bounds = bounds,
-                          loss_fn=loss_fn, maxiter=maxiter),
-        in_axes=0   # map over first axis of params0 (the starts axis)
-    )
-    all_params, all_losses = run_all_starts(starts)
+    import functools
 
-    best_idx    = jnp.argmin(all_losses)
-    best_params = jax.tree_util.tree_map(lambda a: a[best_idx], all_params)
-    best_loss   = all_losses[best_idx]
-    return best_params, best_loss
+    init_state = LoopState(
+        params     = jax.tree_util.tree_map(lambda s: s[0], starts),
+        shift      = jnp.array(0.0),
+        mask       = mask,
+        delta      = jnp.array(jnp.inf),
+        delta_prev = jnp.array(jnp.inf),
+        shift_prev = jnp.array(0.0),
+    )
+
+    def cond_fn(state):
+        not_converged = (
+            (state.delta      > delta_lim) &
+            (jnp.abs(state.shift) > shift_lim) &
+            (state.delta != state.delta_prev)    # oscillation check
+        )
+        return not_converged
+
+    body_fn = functools.partial(
+        _one_iter,
+        x       = x,
+        y       = y,
+        yerr    = yerr,
+        starts  = starts,
+        bounds  = bounds,
+        scatter = scatter,
+        maxiter = maxiter,
+    )
+
+    # Run up to numiter iterations via lax.fori_loop
+    # (fori_loop is simpler than while_loop when numiter is fixed and small)
+    final_state = jax.lax.fori_loop(
+        0, numiter,
+        lambda i, s: jax.lax.cond(
+            cond_fn(s),
+            lambda s: body_fn(s),
+            lambda s: s,
+            s
+        ),
+        init_state
+    )
+
+    return final_state.params, final_state.shift, final_state.mask
 
 # ── Batch fitter: vmap over segments ─────────────────────────────────────────
 
-def make_batch_fitter(loss_fn : callable,
-                      num_starts: int = 4,
-                      maxiter   : int = 300
+def make_batch_fitter(scatter  = None,
+                      numiter  : int = 5,
+                      maxiter  : int = 300,
                       ) -> callable:
     """
-    Returns a jit+vmap compiled function that fits all segments in a batch.
+    Returns a jit+vmap compiled function that runs the full iterative
+    fit+recenter loop for ALL segments simultaneously on the GPU.
 
-    Usage
-    -----
-    fit_batch = make_batch_fitter(loss_LSF, num_starts=4)
-    all_params, all_losses = fit_batch(x, flx, err, mask, starts)
+    Each segment runs fit_one_segment which internally uses:
+      - loss_LSF (unchanged)
+      - build_LSF_GP (via estimate_centre_anderson and get_residuals)
+      - build_scatter_GP (if scatter is not None)
 
-    Parameters
-    ----------
-    loss_fn    : one of loss_LSF or loss_scatter
-    num_starts : number of random restarts per segment
-    maxiter    : L-BFGS-B iteration limit
-
-    Returns
-    -------
-    Compiled function with signature:
-        (x, flx, err, mask, starts) ->  (params_batch, losses_batch)
-    where x/flx/err/mask have shape (N_seg, max_len)
-    and starts is a dict with each leaf of shape (N_seg, num_starts)
+    Signature of returned function:
+        fit_batch(x, y, y_err, mask, starts, bounds)
+            -> (params_batch, shifts_batch, masks_batch)
+    where x/y/y_err/mask have shape (N_seg, max_len)
+    and each starts leaf has shape (N_seg, num_starts)
+    and each bounds leaf has shape (N_seg,)
     """
-    def _fit_segment_wrapper(x, y, yerr, mask, starts, bounds):
-        return fit_one_segment(x, y, yerr, mask, starts, bounds,
-                               loss_fn=loss_fn, maxiter=maxiter)
+    def _wrapper(x, y, yerr, mask, starts, bounds):
+        return fit_one_segment(
+            x, y, yerr, mask, starts, bounds,
+            scatter = scatter,
+            numiter = numiter,
+            maxiter = maxiter,
+        )
 
-    vmapped = jax.vmap(_fit_segment_wrapper, in_axes=(0, 0, 0, 0, 0, 0))
+    vmapped = jax.vmap(_wrapper, in_axes=(0, 0, 0, 0, 0, 0))
     return jax.jit(vmapped)
 
-# ── GP prediction (for recentering) ──────────────────────────────────────────
+# ── Outlier mask update using existing get_residuals ─────────────────────────
 
-def predict_lsf(params : dict,
-                x_train: jnp.ndarray,
-                y_train: jnp.ndarray,
-                yerr   : jnp.ndarray,
-                mask   : jnp.ndarray,
-                x_pred : jnp.ndarray
-                ) -> tuple[jnp.ndarray, jnp.ndarray]:
+def _update_mask_from_residuals(x        : jnp.ndarray,
+                                y        : jnp.ndarray,
+                                y_err    : jnp.ndarray,
+                                theta    : dict,
+                                mask     : jnp.ndarray,
+                                scatter  = None,
+                                sigma_clip: float = 4.0,
+                                ) -> jnp.ndarray:
     """
-    Compute GP posterior mean and variance at x_pred given trained params.
-    Used during the recentering iterations.
+    Recompute outlier mask using get_residuals (which uses build_LSF_GP).
+    Padded points (mask=0) are always excluded regardless of residual.
     """
-    kernel = (
-        jnp.exp(params['log_amp']) *
-        tinygp.kernels.ExpSquared(jnp.exp(params['log_scale']))
+    # get_residuals uses build_LSF_GP internally — do not duplicate that logic
+    rsd = get_residuals(x, y, y_err, theta, scatter)
+
+    # Sigma-clip using only currently-good real points
+    good      = mask > 0.5
+    rsd_good  = jnp.where(good, rsd, 0.0)
+    n_good    = jnp.maximum(jnp.sum(good), 1)
+    mean_rsd  = jnp.sum(rsd_good) / n_good
+    var_rsd   = jnp.sum(jnp.where(good, (rsd - mean_rsd)**2, 0.0)) / n_good
+    sigma_rsd = jnp.sqrt(var_rsd)
+
+    is_outlier = jnp.abs(rsd - mean_rsd) > sigma_clip * sigma_rsd
+    # Outliers become 0, padded points stay 0, good points stay 1
+    return jnp.where(is_outlier, 0.0, mask)
+
+
+
+# ── Centre estimation using existing estimate_centre_anderson ─────────────────
+
+def _get_centre(x      : jnp.ndarray,
+                y      : jnp.ndarray,
+                y_err  : jnp.ndarray,
+                theta  : dict,
+                scatter = None,
+                ) -> tuple[float, float]:
+    """
+    Thin wrapper around estimate_centre_anderson which uses build_LSF_GP.
+    Returns (shift, shift_err).
+    """
+    return estimate_centre_anderson(x, y, y_err, theta, scatter)
+
+
+
+# ── Loop state ────────────────────────────────────────────────────────────────
+
+from typing import NamedTuple
+
+class LoopState(NamedTuple):
+    params     : dict
+    shift      : jnp.ndarray   # total cumulative shift (scalar)
+    mask       : jnp.ndarray   # good-point mask (max_len,)
+    delta      : jnp.ndarray   # |shift_j - shift_{j-1}|
+    delta_prev : jnp.ndarray   # delta from j-2 (oscillation detection)
+    shift_prev : jnp.ndarray   # shift from previous iteration
+
+# ── One recentering iteration ─────────────────────────────────────────────────
+
+def _one_iter(state   : LoopState,
+              x       : jnp.ndarray,
+              y       : jnp.ndarray,
+              yerr    : jnp.ndarray,
+              starts  : dict,
+              bounds  : tuple,
+              scatter,
+              maxiter : int,
+              ) -> LoopState:
+    """
+    One recentering iteration:
+      1. Apply current shift to x
+      2. Apply current mask to errors (padded/outlier points get huge errors)
+      3. Multi-start L-BFGS-B using loss_LSF (unchanged)
+      4. Estimate new centre using estimate_centre_anderson (uses build_LSF_GP)
+      5. Update shift and outlier mask using get_residuals (uses build_LSF_GP)
+    """
+    # Step 1: apply shift — recentering is done by shifting x
+    x_shifted = x + state.shift
+
+    # Step 2: apply mask to errors so padded/outlier points are invisible
+    y_err_masked = jnp.where(state.mask > 0.5, yerr, 1e9)
+
+    # Step 3: multi-start optimisation — vmap over starts axis
+    def run_one(p0):
+        return _run_one_start(p0, x_shifted, y, y_err_masked,
+                              bounds, scatter, maxiter)
+
+    all_params, all_losses = jax.vmap(run_one)(starts)
+    best_idx    = jnp.argmin(all_losses)
+    best_params = jax.tree_util.tree_map(lambda a: a[best_idx], all_params)
+
+    # Step 4: estimate centre using estimate_centre_anderson (uses build_LSF_GP)
+    # Note: estimate_centre_anderson is not JAX-traceable (uses scipy brentq
+    # internally in some variants) so we use the anderson variant which uses
+    # only jax.grad and is traceable.
+    shift_j, _ = estimate_centre_anderson(
+        x_shifted, y, y_err_masked, best_params, scatter
     )
-    gp   = tinygp.GaussianProcess(
-        kernel, x_train,
-        diag = yerr**2 + (1 - mask) * 1e18
+    shift_j   = jnp.clip(jnp.array(shift_j), -1.0, 1.0)
+    new_shift  = state.shift + shift_j
+
+    # Step 5: update outlier mask using get_residuals (uses build_LSF_GP)
+    new_mask = _update_mask_from_residuals(
+        x_shifted, y, y_err_masked, best_params, state.mask, scatter
     )
-    mean, var = gp.predict(y_train, x_pred, return_var=True)
-    return mean, var
 
-# @jax.jit
-# def loss_LSF(theta,X,Y,Y_err,scatter=None):
-#     gp = build_LSF_GP(theta,X,Y,Y_err,scatter)
-#     return -gp.log_probability(Y)
+    new_delta      = jnp.abs(shift_j - state.shift_prev)
+    new_delta_prev = state.delta
 
-# vectorized_loss_LSF = jax.vmap(loss_LSF, in_axes=(0, 0, 0, 0, None))
-
-# @jax.jit
-# def loss_scatter(theta,X,Y,Y_err):
-#     gp = build_scatter_GP(theta,X,Y_err)
-#     return -gp.log_probability(Y)
-
-# vectorized_loss_scatter = jax.vmap(loss_scatter, in_axes=(0, 0, 0, 0))
-
-def _check_arrays(*args):
-    conditions = np.array([np.isfinite(_) for _ in args])
-    finite  = np.logical_and.reduce(conditions)
-    cut     = np.where(finite)[0]
-    return cut
-
-
-def get_lsf_bounds(X, Y, Y_err):
-    """
-    Calculates boxed constraints for GP hyperparameter optimization 
-    based on the data and an initial Gaussian fit.
-    """
-
-    # Initial guess for the mean function (A, mu, sigma, offset)
-    # p0 = (jnp.max(Y), 0, jnp.std(X), 0)
-    # cut = _check_arrays(X, Y, Y_err)
-    # if len(cut)<2:
-        # logger.warning('Data is wrong!')
-        # print(X,Y,Y_err)
-    # X = X[cut]
-    # Y = Y[cut]
-    # Y_err = Y_err[cut]
-    # Perform a preliminary Gaussian fit to establish constraint center
-    # Logic follows gp.txt [3]
-    # popt, pcov = curve_fit(hf.gauss4p, X, Y, sigma=Y_err, absolute_sigma=False, p0=p0)
-    # perr = np.sqrt(np.diag(pcov))
-    
-    # The 'kappa' factor determines the width of the search space 
-    # around the initial fit. gp.txt uses 5 [1].
-    # kappa = 5
-    
-    lower_bounds = dict(
-        mf_amp       = 0.8*np.max(Y), #popt[0]-kappa*perr[0],
-        mf_loc       = -1.0, #popt[1]-kappa*perr[1],
-        mf_log_sig   = 1e-10, #np.log(np.clip(popt[2]-kappa*perr[2], 1e-10, 1e10)),
-        mf_const     = -0.1, #popt[3]-kappa*perr[3],
-        gp_log_amp   = -4., #popt[0]/3.-kappa*perr[0],
-        gp_log_scale = -1.,
-        log_var_add  = -15.,
+    return LoopState(
+        params     = best_params,
+        shift      = new_shift,
+        mask       = new_mask,
+        delta      = new_delta,
+        delta_prev = new_delta_prev,
+        shift_prev = jnp.array(shift_j),
     )
-    upper_bounds = dict(
-        mf_amp       = 1.2*np.max(Y), #popt[0]+kappa*perr[0],
-        mf_loc       = +1.0, #popt[1]+kappa*perr[1],
-        mf_log_sig   = 2e0, #np.log(popt[2]+kappa*perr[2]),
-        mf_const     = +0.1, #popt[3]+kappa*perr[3],
-        gp_log_amp   = 4., # popt[0]/3.+kappa*perr[0],
-        gp_log_scale = 1.,
-        log_var_add  = 1.5,
-    )
-    
-    
-    return (lower_bounds, upper_bounds)
 
 
+def make_dummy_scatter(X):
+    theta_scatter = {
+        "sct_log_const": 0.0,
+        "sct_log_amp": -20.0,   # kills GP amplitude
+        "sct_log_scale": 1.0,
+        "sct_log_epsilon0": -10.0,
+    }
 
+    zeros = jnp.zeros_like(X)
 
-@ray.remote
-def run_lsf_optimization_task(theta_start, X, Y, Y_err, scatter, bounds):
-    """
-    Ray Task: Performs a single L-BFGS-B optimization.
-    JAX JIT is utilized within the loss_LSF function.
-    """
-    # Import within task to ensure availability on remote workers
-    
-    lbfgsb = jaxopt.ScipyBoundedMinimize(
-        fun=functools.partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter),
-        method="l-bfgs-b"
-    )
-    
-    # Run the optimization
-    try:
-        solution = lbfgsb.run(theta_start, bounds=bounds)
-        # Return the params and the final loss value for comparison
-        return solution.params, solution.state.value
-    except Exception as e:
-        return None, jnp.inf
-    
-def run_lsf_optimization_local(theta_start, X, Y, Y_err, scatter, bounds):
-    """Local helper to run optimization without Ray .remote overhead."""
-    # lbfgsb = jaxopt.ScipyBoundedMinimize(
-    #     fun=partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter),
-    #     method="l-bfgs-b"
-    # )
-    lbfgsb = jaxopt.LBFGSB(
-        fun=functools.partial(loss_LSF, X=X, Y=Y, Y_err=Y_err, scatter=scatter)
-    )
-    try:
-        params, state = lbfgsb.run(theta_start, bounds=bounds)
-        
-        # return params, state.fun_val
-        return params, loss_LSF(params, X, Y, Y_err, scatter)
-    except Exception as e:
-        print(f"EXCEPTION {e}")
-        return None, jnp.inf
-    
-vectorized_run_lsf_optimization_local = jax.vmap(run_lsf_optimization_local, 
-                                                 in_axes=(0,None,None,None,None,None))
-    
-def train_LSF_multistart_ray(X, Y, Y_err, scatter=None, num_starts=4):
-    """
-    Revised multi-start GP training. 
-    Runs optimizations serially to prevent nested Ray deadlocks.
-    """
-    # 1. Generate diverse starting guesses
-    starts = generate_starting_guesses(X, Y, Y_err, num_starts)
-    bounds = get_lsf_bounds(X, Y, Y_err)
-    
-    starts_batched = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *starts)
-    # print('bounds')
-    # print(bounds)
-    
-    # print('starts_batched')
-    # print(starts_batched)
-    # 2. Execute optimizations serially on the current worker
-    results = vectorized_run_lsf_optimization_local(starts_batched,
-                                                    X, 
-                                                    Y, 
-                                                    Y_err,
-                                                    scatter,
-                                                    bounds)
-    params_batched, losses_batched = results
-    best_index = jnp.argmin(losses_batched)
-    best_params = jax.tree_util.tree_map(lambda x: x[best_index], params_batched)
-    best_loss = losses_batched[best_index]
-    
-    return best_params, best_loss
-    # results = []
-    # for s in starts:
-    #     res = run_lsf_optimization_local(s, X, Y, Y_err, scatter, bounds)
-    #     results.append(res)
-    
-    # 3. Filter failures and choose the best log-likelihood [3, 4]
-    # valid_results = [res for res in results if res is not None]
-    # params_batched, losses_batched = results
-    # valid_results = [
-    #     (jax.tree_util.tree_map(lambda x: x[i], params_batched),
-    #      losses_batched[i])
-    #     for i in range(losses_batched.shape[0])
-    #     if not jnp.isinf(losses_batched[i])
-    # ]
-        
-    # print('valid results')
-    # print(valid_results)
-    # if not valid_results:
-    #     raise RuntimeError("All hyperparameter optimization starts failed.")
-        
-    # best_params = min(valid_results, key=lambda x: x[1])
-    # print('best params')
-    # print(best_params)
-    # return best_params
-    
-
-
-def generate_theta_stack(X_stack, Y_stack, Yerr_stack):
-    """
-    Generates a PyTree of initial hyperparameter guesses for a batch of segments.
-    
-    Each parameter in the returned dictionary is an array of shape (num_segments,),
-    enabling JAX to map operations across the batch dimension.
-    
-    Parameters:
-    -----------
-    X_stack, Y_stack, Yerr_stack : jnp.ndarray
-        2D JAX arrays of shape (num_segments, num_points) containing padded data.
-        
-    Returns:
-    --------
-    theta_stack : dict
-        A PyTree where keys are hyperparameter names (e.g., 'mf_amp', 'gp_log_scale')
-        and values are arrays of initial guesses.
-    """
-    num_segs = X_stack.shape
-    # Initialize the dictionary keys based on the LFC parameter list [3]
-    theta_stack = {name: jnp.zeros(num_segs) for name in gp_aux.parnames_lfc}
-    
-    for i in range(num_segs):
-        # Initial guess logic follows train_LSF_tinygp [1, 4]
-        # We assume data is centered (mf_loc ~ 0) and use standard deviations
-        A0 = jnp.nanmax(Y_stack[i])
-        s0 = jnp.clip(jnp.nanstd(X_stack[i]), 0.5, 2.0)
-        
-        theta_stack['mf_amp'] = theta_stack['mf_amp'].at[i].set(A0)
-        theta_stack['mf_loc'] = theta_stack['mf_loc'].at[i].set(0.0)
-        theta_stack['mf_log_sig'] = theta_stack['mf_log_sig'].at[i].set(jnp.log(s0))
-        theta_stack['mf_const'] = theta_stack['mf_const'].at[i].set(0.0)
-        theta_stack['gp_log_amp'] = theta_stack['gp_log_amp'].at[i].set(jnp.log(A0 / 5.0))
-        theta_stack['gp_log_scale'] = theta_stack['gp_log_scale'].at[i].set(0.0)
-        theta_stack['log_var_add'] = theta_stack['log_var_add'].at[i].set(-5.0)
-        
-    return theta_stack
-
-def get_bounds_stack(X_stack, Y_stack, Yerr_stack):
-    """
-    Generates lower and upper bound PyTrees for vectorized GP optimization.
-    
-    Parameters:
-    -----------
-    X_stack, Y_stack, Yerr_stack : jnp.ndarray
-        2D JAX arrays of shape (num_segments, num_points).
-        
-    Returns:
-    --------
-    bounds : tuple (dict, dict)
-        A tuple containing the lower_bounds and upper_bounds PyTrees.
-    """
-    num_segs = X_stack.shape
-    lb_stack = {name: jnp.zeros(num_segs) for name in gp_aux.parnames_lfc}
-    ub_stack = {name: jnp.zeros(num_segs) for name in gp_aux.parnames_lfc}
-    
-    for i in range(num_segs):
-        # Boundary logic adapted from get_lsf_bounds [1, 5]
-        A0 = jnp.nanmax(Y_stack[i])
-        
-        # Mean Function bounds
-        lb_stack['mf_amp'] = lb_stack['mf_amp'].at[i].set(0.5 * A0)
-        ub_stack['mf_amp'] = ub_stack['mf_amp'].at[i].set(2.0 * A0)
-        lb_stack['mf_loc'] = lb_stack['mf_loc'].at[i].set(-0.5) # Allow small shifts [4]
-        ub_stack['mf_loc'] = ub_stack['mf_loc'].at[i].set(0.5)
-        lb_stack['mf_log_sig'] = lb_stack['mf_log_sig'].at[i].set(jnp.log(0.1))
-        ub_stack['mf_log_sig'] = ub_stack['mf_log_sig'].at[i].set(jnp.log(5.0))
-        lb_stack['mf_const'] = lb_stack['mf_const'].at[i].set(-1.0)
-        ub_stack['mf_const'] = ub_stack['mf_const'].at[i].set(1.0)
-        
-        # GP Kernel bounds [7, 8]
-        lb_stack['gp_log_amp'] = lb_stack['gp_log_amp'].at[i].set(-4.0)
-        ub_stack['gp_log_amp'] = ub_stack['gp_log_amp'].at[i].set(4.0)
-        lb_stack['gp_log_scale'] = lb_stack['gp_log_scale'].at[i].set(-1.0)
-        ub_stack['gp_log_scale'] = ub_stack['gp_log_scale'].at[i].set(1.0)
-        lb_stack['log_var_add'] = lb_stack['log_var_add'].at[i].set(-15.0)
-        ub_stack['log_var_add'] = ub_stack['log_var_add'].at[i].set(1.5)
-        
-    return (lb_stack, ub_stack)
-
-def generate_starting_guesses(X, Y, Y_err, n):
-    """
-    Generates variations of the initial hyperparameters to explore
-    different regions of the likelihood surface.
-    """
-    
-    # Get the standard initial guess from existing logic
-    base_theta = train_LSF_tinygp(X, Y, Y_err, return_only_init=True)
-    
-    guesses = []
-    # Seed 0 is always the base guess
-    guesses.append(base_theta)
-    
-    # Add variations for other starts
-    # We vary gp_log_scale (correlation length) and gp_log_amp
-    for i in range(1, n):
-        new_theta = base_theta.copy()
-        # Perturb length-scale log-space by +/- 0.5
-        new_theta['gp_log_scale'] += np.random.uniform(-0.5, 0.5)
-        # Perturb GP amplitude
-        new_theta['gp_log_amp'] += np.random.uniform(-1.0, 1.0)
-        guesses.append(new_theta)
-        
-    return guesses
-    
-def train_LSF_tinygp(X,Y,Y_err,scatter=None, return_only_init=False):
-    '''
-    Returns parameters which minimise the loss function defined below.
-
-    Parameters
-    ----------
-    X : TYPE
-        DESCRIPTION.
-    Y : TYPE
-        DESCRIPTION.
-    Y_err : TYPE
-        DESCRIPTION.
-    scatter : TYPE, optional
-        DESCRIPTION. The default is None.
-
-    Returns
-    -------
-    solution : TYPE
-        DESCRIPTION.
-
-    '''
-    p0 = (np.max(Y),0,np.std(X),0)
-    # plt.errorbar(X,Y,Y_err,marker='o',ls='')
-    
-    logger = logging.Logger(__name__+'gp.train_LSF')
-    logger.info('Found popt')
-    cut = _check_arrays(X, Y, Y_err)
-    if len(cut)<2:
-        logger.warning('Data is wrong!')
-        print(X,Y,Y_err)
-    X = X[cut]
-    Y = Y[cut]
-    Y_err = Y_err[cut]
-    
-    # print(len(X),len(Y),len(Y_err))
-    popt,pcov = scipy.optimize.curve_fit(hf.gauss4p,X._value,Y._value,sigma=Y_err._value,
-                          absolute_sigma=False,p0=p0)
-    
-    perr = np.sqrt(np.diag(pcov))
-    
-    theta = dict(
-        mf_amp        = popt[0],
-        mf_loc        = popt[1],
-        mf_log_sig    = jnp.log(popt[2]),
-        mf_const      = popt[3],
-        gp_log_amp    = 1.,#popt[0]/5.,
-        gp_log_scale  = 0.,
-        log_var_add   = -5.,
-    )
-    if return_only_init:
-        return theta
-    
-    kappa = 5
-    lower_bounds = dict(
-        mf_amp       = popt[0]-kappa*perr[0],
-        mf_loc       = popt[1]-kappa*perr[1],
-        mf_log_sig   = np.log(np.clip(popt[2]-kappa*perr[2], 1e-10, 1e10)),
-        mf_const     = popt[3]-kappa*perr[3],
-        gp_log_amp   = -4., #popt[0]/3.-kappa*perr[0],
-        gp_log_scale = -1.,
-        log_var_add  = -15.,
-    )
-    upper_bounds = dict(
-        mf_amp       = popt[0]+kappa*perr[0],
-        mf_loc       = popt[1]+kappa*perr[1],
-        mf_log_sig   = np.log(popt[2]+kappa*perr[2]),
-        mf_const     = popt[3]+kappa*perr[3],
-        gp_log_amp   = 4., # popt[0]/3.+kappa*perr[0],
-        gp_log_scale = 1.,
-        log_var_add  = 1.5,
-    )
-    # print(popt); print(perr); print(theta)#; sys.exit()
-    bounds = (lower_bounds, upper_bounds)
-    # print(bounds)
-    lbfgsb = jaxopt.ScipyBoundedMinimize(fun=functools.partial(loss_LSF,
-                                                      X=X,
-                                                      Y=Y,
-                                                      Y_err=Y_err,
-                                                      scatter=scatter),
-                                          method="l-bfgs-b")
-    solution = lbfgsb.run(jax.tree.map(jnp.asarray, theta), bounds=bounds)
-    
-    # solver = jaxopt.GradientDescent(fun=partial(loss_LSF,
-    #                                           X=X,
-    #                                           Y=Y,
-    #                                           Y_err=Y_err,
-    #                                           scatter=scatter
-    #                                           ))
-    # solution = solver.run(jax.tree_map(jnp.asarray, theta))
-    # try:
-    #     print(f"Best fit parameters: {solution.params}")
-    # except: pass
-    # debug = False
-    # logger = logging.getLogger(__name__)
-    # if debug:
-    #     try:
-    #         logger.info(f"Final -log(L): {solution.state.fun_val}")
-    #     except: pass
-    return solution.params
-
-        
+    return (theta_scatter, zeros, zeros, zeros)
     
 def get_model(x_test,X,Y,Y_err,theta,scatter=None):
     # print('get_model',*[np.shape(_) for _ in [x_test,X,Y,Y_err]])
@@ -823,7 +603,11 @@ def get_scatter_covar(X,Y,Y_err,theta_lsf):
     
 
 
-def rescale_errors(scatter,X,Y_err,plot=False,ax=None):
+def rescale_errors(use_scatter : bool,
+                   scatter,
+                   X : jnp.ndarray,
+                   Y_err : jnp.ndarray
+                   ):
     '''
     Performs error rescaling, as determined by the scatter parameters
 
@@ -847,15 +631,25 @@ def rescale_errors(scatter,X,Y_err,plot=False,ax=None):
     
     
     
+    # Always unpack (scatter must always exist!)
     theta_scatter, logvar_x, logvar_y, logvar_err = scatter
     
-    
+    # Always compute scatter GP
     sct_gp        = build_scatter_GP(theta_scatter,logvar_x,logvar_err)
     _, sct_cond   = sct_gp.condition(logvar_y,X)
     F_mean  = sct_cond.mean
     F_sigma = jnp.sqrt(sct_cond.variance)
     
-    S, S_var = transform(X,Y_err,F_mean,F_sigma,sct_gp,logvar_y)
+    S_scatter, S_var_scatter = transform(X,Y_err,F_mean,F_sigma,sct_gp,logvar_y)
+    
+    # Define "no scatter" behavior
+    S_noscatter = Y_err
+    S_var_noscatter = jnp.zeros_like(Y_err)
+
+    # Blend results (THIS is the key trick)
+    S     = jnp.where(use_scatter, S_scatter, S_noscatter)
+    S_var = jnp.where(use_scatter, S_var_scatter, S_var_noscatter)
+    
     return S, S_var
 
 def plot_variance_GP(scatter,X,Y_err,plot=False,ax=None):
@@ -1007,7 +801,10 @@ def gaussian_mean_function(theta, X):
     
     return jnp.array([theta['mf_amp'],theta['mf_const']]) @ beta
 
-def build_scatter_GP(theta,X,mask,Y_err=None):
+def build_scatter_GP(theta : dict,
+                     X : jnp.ndarray,
+                     Y_err : jnp.ndarray,
+                     use_yerr : bool = False):
     '''
     Returns Gaussian Process for the intrinsic scatter of points (beyond noise)
 
@@ -1036,7 +833,7 @@ def build_scatter_GP(theta,X,mask,Y_err=None):
         val = 1e-8
         # val = jnp.exp(theta['sct_log_epsilon0'])
         return tinygp.noise.Diagonal(jnp.full_like(X,val))
-    noise1d = jax.lax.cond(pred,true_func,false_func) + (1 - mask) * 1e18
+    noise1d = jax.lax.cond(pred,true_func,false_func)# + (1 - mask) * 1e18
     sct_kernel = sct_amp * tinygp.kernels.ExpSquared(sct_scale) #+ kernels.Constant(sct_const)
     # sct_kernel = sct_amp * kernels.Matern52(sct_scale) #+ kernels.Constant(sct_const)
     return tinygp.GaussianProcess(
@@ -1046,7 +843,13 @@ def build_scatter_GP(theta,X,mask,Y_err=None):
         mean = sct_const
     )
 
-def build_LSF_GP(theta_lsf,X,mask,Y=None,Y_err=None,scatter=None):
+def build_LSF_GP(theta_lsf : dict,
+                 X : jnp.ndarray,
+                 # Y : jnp.ndarray = None,
+                 Y_err : jnp.ndarray,
+                 use_yerr : bool = False,
+                 scatter : list = [], 
+                 use_scatter = False):
     '''
     Returns a Gaussian Process for the LSF. If scatter is not None, tries to 
     include a second GP for the intrinsic scatter of datapoints beyond the
@@ -1075,19 +878,10 @@ def build_LSF_GP(theta_lsf,X,mask,Y=None,Y_err=None,scatter=None):
     # Various variances (obs=observed, add=constant random noise, tot=total)
     var_add = jnp.exp(theta_lsf['log_var_add']) 
     
-    if scatter is not None:   
-        S, S_var = rescale_errors(scatter, X, Y_err)
-        var_data  = jnp.power(S,2.)
-    else:
-        _pred_ = Y_err!=None
-        def _true_func():
-            return jnp.power(Y_err,2.)
-        def _false_func():
-            return jnp.full_like(X, 1e-8)
-        var_data = jax.lax.cond(_pred_,_true_func,_false_func)
+    S, S_var = rescale_errors(use_scatter, scatter, X, Y_err)
+    var_data  = jnp.square(S)
     var_tot = var_data + var_add
-    noise2d = jnp.diag(var_tot) + (1 - mask) * 1e18
-    Noise2d = tinygp.noise.Dense(noise2d) + (1 - mask) * 1e18
+    noise2d = jnp.diag(var_tot) #+ (1 - mask) * 1e18
     
     
     return tinygp.GaussianProcess(

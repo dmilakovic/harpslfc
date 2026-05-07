@@ -318,14 +318,7 @@ def from_spectrum_2d(spec,
         f"Using {n_workers} {'GPU' if use_gpu else 'CPU'} worker(s) "
         f"(platform: {platform})"
     )
-    # actors    = [
-    #     GPUFitter.remote(
-    #         loss_name  = loss_name,
-    #         num_starts = num_starts,
-    #         maxiter    = maxiter_lbfgs,
-    #     )
-    #     for _ in range(n_gpus)
-    # ]
+    
 
     # ── Step 5: dispatch sub-batches ──────────────────────────────────────────
     sub_batches = split_batch(full_batch, n_workers)
