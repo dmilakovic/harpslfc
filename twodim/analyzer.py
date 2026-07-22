@@ -274,7 +274,7 @@ class EchelleAnalyzer:
 
         # If file doesn't exist OR clobber is allowed and it *does* exist
         needs_creation = not self._fits_file_created or (self._fits_file_created and self.clobber_allowed)
-
+        print(f"FITS file needs creation... ")
         if needs_creation:
              if self._fits_file_created and self.clobber_allowed:
                   print(f"Output file {self.output_fits_path} exists. Overwriting (clobber=True).")
@@ -585,7 +585,6 @@ class EchelleAnalyzer:
                  # Open in read-write ('rw') to check structure but allow appending later
                  try:
                      with fitsio.FITS(self.output_fits_path, 'rw') as fits:
-                         print(fits)
                          if extname_to_check in fits and fits[extname_to_check].get_exttype() == 'BINTABLE':
                               # Valid structure found
                               print("  Existing file is valid for appending.")
@@ -619,7 +618,8 @@ class EchelleAnalyzer:
                  # Clobber is effectively true for initial creation
                  self.clobber_allowed = True # Ensure it's set correctly
                  self._fits_file_created = False # Structure needs creation
-
+                 with fitsio.FITS(self.output_fits_path, 'rw') as fits:
+                     self._ensure_fits_structure()
             # If we reach here, loading was successful and FITS status is determined
             return True
 
@@ -725,7 +725,11 @@ class EchelleAnalyzer:
 
             print("Median segment positions calculated (using median of peaks segmented along Y-sorted trace).")
             return True
-        except Exception as e: print(f"Error during clustering/median calc: {e}"); traceback.print_exc(); self.paired_orders_dict = None; return False
+        except Exception as e: 
+            print(f"Error during clustering/median calc: {e}")
+            traceback.print_exc()
+            self.paired_orders_dict = None
+            return False
         
     def _process_single_stamp(self, peak_xy):
         """ Internal helper: Processes a single peak. Returns dict or None. """
@@ -1211,7 +1215,10 @@ class EchelleAnalyzer:
                           self.all_peaks_xy = np.vstack([data['PEAK_X'],data['PEAK_Y']]).T
                           print("Saved the catalog internally into .all_peaks_xy (any old value is overwritten)")
                       return data
-                 else: print(f"Error: HDU '{extname}' not found in {path}"); return None
+                 else: 
+                     print(f"Error: HDU '{extname}' not found in {path}, calculating")
+                     self.find_all_peaks(plot_interactive=True, detector='red')
+                     return self.all_peaks_xy
         except Exception as e: print(f"Error reading FITS file {path}: {e}"); return None
 
     def get_peaks_for_segment(self, order_num, img_type_int, segment_idx, fits_path=None):

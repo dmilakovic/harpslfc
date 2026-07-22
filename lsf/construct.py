@@ -55,89 +55,124 @@ def make_fitter_actor(use_gpu: bool = True):
 # ─────────────────────────────────────────────────────────────────────────────
 # Ray remote worker
 # ─────────────────────────────────────────────────────────────────────────────
-
 class GPUFitter:
     """
-    Stateful Ray actor: owns one GPU for the lifetime of the exposure.
+    Stateful Ray actor owning one GPU.
+    Processes all segments of one exposure through both phases.
 
-    Using an Actor (rather than a stateless @ray.remote function) means
-    JAX JIT compilation happens once per actor, not once per task call.
-    The compiled fit_batch function is cached in self and reused across
-    calls, saving significant overhead.
+    Phase 1 and Phase 2 have separate compiled fitters because they have
+    different static use_scatter flags — JAX compiles a different graph
+    for each. Both are compiled on first call and cached for the lifetime
+    of the actor.
     """
 
-    def __init__(self, loss_name: str = 'lsf',
-                 num_starts: int = 4,
-                 maxiter   : int = 300):
-        import jax
+    def __init__(self,
+                 model_scatter: bool = True,
+                 numiter      : int  = 5,
+                 maxiter      : int  = 300,
+                 ):
+        import os
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+        import jax
+        self.device       = jax.devices()[0]
+        self.model_scatter = model_scatter
 
-        # Confirm this actor sees exactly one GPU
-        platform = get_jax_platform()
-        devices  = jax.devices(platform)
-        self.device = devices[0]
-        logger.info(f"GPUFitter initialised on {self.device} (platform: {platform})")
-
-        # Select loss function
-        loss_fn = gp.loss_LSF if loss_name == 'lsf' else gp.loss_scatter
-
-        # Compile once — reused for all batches sent to this actor
-        self.fit_batch = gp.make_batch_fitter(
-            loss_fn    = loss_fn,
-            num_starts = num_starts,
-            maxiter    = maxiter,
+        # Two separately compiled fitters — one per phase
+        self.phase1_fitter = lsfgp.make_phase_fitter(
+            use_scatter = False,
+            numiter     = numiter,
+            maxiter     = maxiter,
         )
-        self.num_starts = num_starts
-    
-    def fit(self, batch: SegmentBatch) -> list[dict | None]:
+        self.phase2_fitter = lsfgp.make_phase_fitter(
+            use_scatter = True,
+            numiter     = numiter,
+            maxiter     = maxiter,
+        ) if model_scatter else None
+
+    def fit(self, batch) -> list[dict]:
         """
-        Fit all segments in a SegmentBatch on this actor's GPU.
+        Full two-phase fit for all segments in the batch.
 
-        Parameters
-        ----------
-        batch : SegmentBatch — padded JAX arrays + metadata
-
-        Returns
-        -------
-        list of dicts (one per segment) with keys:
-            params, loss, order, pixl, pixr
+        Phase 1: jit+vmap on GPU — all segments in one dispatch
+        Scatter: CPU loop — sequential but lightweight
+        Phase 2: jit+vmap on GPU — all segments in one dispatch (if model_scatter)
         """
         import jax
-        import jax.numpy as jnp
+        import numpy as np
 
         N = len(batch.meta)
         if N == 0:
             return []
 
-        # Generate starting guesses for all segments × all starts
-        starts = gp.generate_starts_batch(
-            batch.x, batch.flx, batch.err, self.num_starts
-            )
-        bounds = gp.generate_bounds_batch(
-                            batch.x, batch.flx, batch.err
-                                )
-    
-
-        # Single GPU dispatch — all N segments fitted in parallel
-        t0 = time.time()
-        all_params, all_losses = self.fit_batch(
-            batch.x, batch.flx, batch.err, batch.mask, starts, bounds
+        # ── Generate starts and bounds ────────────────────────────────────────
+        starts = gp_aux.generate_starts_batch(
+            batch.x, batch.flx, batch.err, num_starts=4
         )
-        jax.block_until_ready(all_params)  # ensure GPU computation completes
-        dt = time.time() - t0
-        logger.info(f"{self.device}: fitted {N} segments in {dt:.1f}s")
+        bounds = gp_aux.generate_bounds_batch(
+            batch.x, batch.flx, batch.err
+        )
 
-        # Package results
+        # ── Phase 1: no scatter ───────────────────────────────────────────────
+        # scatter_y_err = y_err (no rescaling in Phase 1)
+        phase1_state = self.phase1_fitter(
+            batch.x, batch.flx, batch.err, batch.mask,
+            starts, bounds,
+            batch.err,           # scatter_y_err = original err in Phase 1
+        )
+        jax.block_until_ready(phase1_state.params)
+
+        if not self.model_scatter:
+            # No Phase 2 — package Phase 1 results directly
+            return self._package_results(phase1_state, batch.meta)
+
+        # ── Scatter training (CPU, between phases) ────────────────────────────
+        # This runs on CPU and is sequential across segments.
+        # It is fast relative to the GPU phases because it involves only
+        # 1D GP fitting on binned residuals (~40 points per segment).
+        scatter_list, scatter_y_err = lsfgp.train_scatter_batch(
+            batch.x, batch.flx, batch.err,
+            phase1_state.mask,
+            phase1_state.params,
+        )
+
+        # ── Phase 2: with scatter ─────────────────────────────────────────────
+        # scatter_y_err is now the pre-rescaled error array (N_seg, max_len)
+        # passed into the loop as a fixed array — rescale_errors is NOT
+        # called inside the jit'd loop, keeping it pure and vmappable
+        phase2_state = self.phase2_fitter(
+            batch.x, batch.flx, batch.err, phase1_state.mask,
+            starts, bounds,
+            scatter_y_err,       # pre-rescaled errors — fixed for this phase
+        )
+        jax.block_until_ready(phase2_state.params)
+
+        return self._package_results(phase2_state, batch.meta,
+                                     scatter_list=scatter_list,
+                                     phase1_params=phase1_state.params)
+
+    def _package_results(self,
+                         state        : 'SegmentState',
+                         meta         : list,
+                         scatter_list : list = None,
+                         phase1_params: dict = None,
+                         ) -> list[dict]:
+        """Convert batched JAX state back to per-segment dicts."""
+        import jax
         results = []
-        for i, (od, pixl, pixr) in enumerate(batch.meta):
-            seg_params = jax.tree_util.tree_map(lambda a: a[i], all_params)
-            results.append({
-                'params' : seg_params,
-                'loss'   : float(all_losses[i]),
-                'order'  : od,
-                'pixl'   : pixl,
-                'pixr'   : pixr,
-            })
+        for i, (od, pixl, pixr) in enumerate(meta):
+            seg_params = jax.tree_util.tree_map(lambda a: a[i], state.params)
+            result = {
+                'params'        : seg_params,
+                'shift'         : float(state.shift[i]),
+                'loss'          : float(state.delta[i]),
+                'order'         : od,
+                'pixl'          : pixl,
+                'pixr'          : pixr,
+                'scatter'       : scatter_list[i] if scatter_list else None,
+                'params_nosct'  : (jax.tree_util.tree_map(lambda a: a[i], phase1_params)
+                                   if phase1_params is not None else None),
+            }
+            results.append(result)
         return results
 
 

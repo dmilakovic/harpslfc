@@ -28,16 +28,17 @@ def loss_LSF(params: dict,
              # mask : jnp.ndarray,   # NEW: 1=real, 0=padded
              y    : jnp.ndarray,
              yerr : jnp.ndarray,
-             use_yerr : bool = False,
-             scatter : list = [],
+             # use_yerr : bool = False,
              use_scatter: bool = False,
+             scatter : list = [],
              ) -> jnp.ndarray:
     """
     Negative log marginal likelihood for the LSF GP model.
     Padded points are excluded via mask (their err is 1e9, so they
     contribute negligibly even without masking — mask is a safety net).
     """
-    gp = build_LSF_GP(params,x,yerr,use_yerr, scatter, use_scatter)
+    use_scatter = bool(use_scatter)
+    gp = build_LSF_GP(params,x,yerr, use_scatter,  scatter)
     return -gp.log_probability(y)
 
 def loss_scatter(params: dict,
@@ -50,40 +51,77 @@ def loss_scatter(params: dict,
     gp = build_scatter_GP(params,x, yerr)
     return -gp.log_probability(y)
 
-def _run_one_start(params0 : dict,
-                   x       : jnp.ndarray,
-                   y       : jnp.ndarray,
-                   yerr    : jnp.ndarray,
-                   use_yerr: bool,
-                   mask    : jnp.ndarray,
-                   bounds  : tuple[dict, dict],
-                   scatter : list = [],
-                   use_scatter : bool = False,
-                   maxiter : int = 300
-                   ) -> tuple[dict, jnp.ndarray]:
+def run_lsf_optimization_local(theta_start  : dict,
+                                x            : jnp.ndarray,
+                                y            : jnp.ndarray,
+                                yerr        : jnp.ndarray,
+                                use_scatter  : bool,          # static bool
+                                bounds       : tuple,
+                                scatter_params: dict  = None, # scatter theta only
+                                maxiter      : int   = 300,
+                                ) -> tuple[dict, jnp.ndarray]:
     """
-    Run L-BFGS-B from a single starting point.
-    Pure JAX — vmappable over the starting-point axis.
+    Single L-BFGS-B run from one starting point.
+    use_scatter is a static bool — resolved at trace time, not a JAX value.
+    Supersedes: one call inside the loop of train_LSF_multistart_ray.
+    vmapped over theta_start axis (axis 0) by vectorized_run_lsf_optimization_local.
     """
-    
-    # bounds = generate_bounds_batch(x, y, yerr)
-    
-    solver = jaxopt.LBFGSB(
-        fun = functools.partial(
-                    loss_LSF,
-                    x = x, 
-                    y = y,
-                    yerr = yerr,
-                    use_yerr = use_yerr,
-                    scatter = scatter,
-                    use_scatter = use_scatter),
+    lbfgsb = jaxopt.LBFGSB(
+        fun     = functools.partial(loss_LSF,
+                                    x          = x,
+                                    y          = y,
+                                    yerr       = yerr,
+                                    use_scatter = use_scatter),
         maxiter = maxiter,
         tol     = 1e-5,
     )
-    result = solver.run(params0, bounds=bounds)
-    # Evaluate loss at solution using the unchanged loss_LSF
-    final_loss = loss_LSF(result.params, x, y, yerr, use_yerr, scatter, use_scatter)
+    result     = lbfgsb.run(theta_start, bounds=bounds)
+    final_loss = loss_LSF(result.params, x, y, yerr,
+                          use_scatter=use_scatter)
     return result.params, final_loss
+
+
+# vmap over the starts axis — this is the direct replacement for
+# the Python loop inside train_LSF_multistart_ray
+vectorized_run_lsf_optimization_local = jax.vmap(
+    run_lsf_optimization_local,
+    in_axes=(0, None, None, None, None, None)  # only theta_start varies
+)
+
+# def _run_one_start(params0 : dict,
+#                    x       : jnp.ndarray,
+#                    y       : jnp.ndarray,
+#                    yerr    : jnp.ndarray,
+#                    use_yerr: bool,
+#                    mask    : jnp.ndarray,
+#                    bounds  : tuple[dict, dict],
+#                    scatter : list = [],
+#                    use_scatter : bool = False,
+#                    maxiter : int = 300
+#                    ) -> tuple[dict, jnp.ndarray]:
+#     """
+#     Run L-BFGS-B from a single starting point.
+#     Pure JAX — vmappable over the starting-point axis.
+#     """
+    
+#     # bounds = generate_bounds_batch(x, y, yerr)
+    
+#     solver = jaxopt.LBFGSB(
+#         fun = functools.partial(
+#                     loss_LSF,
+#                     x = x, 
+#                     y = y,
+#                     yerr = yerr,
+#                     use_yerr = use_yerr,
+#                     scatter = scatter,
+#                     use_scatter = use_scatter),
+#         maxiter = maxiter,
+#         tol     = 1e-5,
+#     )
+#     result = solver.run(params0, bounds=bounds)
+#     # Evaluate loss at solution using the unchanged loss_LSF
+#     final_loss = loss_LSF(result.params, x, y, yerr, use_yerr, scatter, use_scatter)
+#     return result.params, final_loss
 
 def generate_starts_batch(x_batch    : jnp.ndarray,   # (N_seg, max_len)
                           flx_batch  : jnp.ndarray,
@@ -191,7 +229,7 @@ def fit_one_segment(x        : jnp.ndarray,   # (max_len,)
     """
     import functools
 
-    init_state = LoopState(
+    init_state = SegmentState(
         params     = jax.tree_util.tree_map(lambda s: s[0], starts),
         shift      = jnp.array(0.0),
         mask       = mask,
@@ -209,7 +247,7 @@ def fit_one_segment(x        : jnp.ndarray,   # (max_len,)
         return not_converged
 
     body_fn = functools.partial(
-        _one_iter,
+        run_lsf_optimization_local,
         x       = x,
         y       = y,
         yerr    = yerr,
@@ -318,74 +356,283 @@ def _get_centre(x      : jnp.ndarray,
 
 from typing import NamedTuple
 
-class LoopState(NamedTuple):
+class SegmentState(NamedTuple):
     params     : dict
     shift      : jnp.ndarray   # total cumulative shift (scalar)
-    mask       : jnp.ndarray   # good-point mask (max_len,)
+    mask       : jnp.ndarray   # good-point mask (max_len,): 1=good, 0=bad/padded
     delta      : jnp.ndarray   # |shift_j - shift_{j-1}|
     delta_prev : jnp.ndarray   # delta from j-2 (oscillation detection)
     shift_prev : jnp.ndarray   # shift from previous iteration
+    converged  : jnp.ndarray   # bool scalar
+    
+def _sigma_clip_mask(rsd       : jnp.ndarray,
+                     mask      : jnp.ndarray,
+                     thresh    : float = 3.5,
+                     ) -> jnp.ndarray:
+    """
+    JAX-compatible sigma clipping. No if/else — uses jnp.where throughout.
+    Replaces hf.is_outlier_original + keep_full logic in model_1s.
+    """
+    good       = mask > 0.5
+    rsd_good   = jnp.where(good, rsd, 0.0)
+    n_good     = jnp.maximum(jnp.sum(good), 1.0)
+    median_rsd = jnp.median(rsd_good, axis = 0)
+    diff       = jnp.sqrt(jnp.sum((rsd - median_rsd)**2, axis = -1))
+    med_abs_deviation = np.median(diff)
+    
+    modified_z_score = 0.6745 * diff / med_abs_deviation
+    is_outlier = modified_z_score > thresh
+    # sq_dev     = jnp.where(good, jnp.square(rsd - mean_rsd), 0.0)
+    # sigma_rsd  = jnp.sqrt(jnp.sum(sq_dev) / n_good)
+    # is_outlier = jnp.abs(rsd - mean_rsd) > sigma_clip * sigma_rsd
+    
+    
+    # median = np.median(points, axis=0)
+    # diff = np.sum((points - median)**2, axis=-1)
+    # diff = np.sqrt(diff)
+    # med_abs_deviation = np.median(diff)
+
+    
+
+    # return modified_z_score > thresh
+
+
+    # Outliers become 0; padded points (already 0) stay 0
+    return jnp.where(is_outlier, 0.0, mask)
 
 # ── One recentering iteration ─────────────────────────────────────────────────
 
-def _one_iter(state   : LoopState,
-              x       : jnp.ndarray,
-              y       : jnp.ndarray,
-              yerr    : jnp.ndarray,
-              starts  : dict,
-              bounds  : tuple,
-              scatter,
-              maxiter : int,
-              ) -> LoopState:
+
+def _recentering_iter(i           : int,
+                      state       : SegmentState,
+                      x           : jnp.ndarray,
+                      y           : jnp.ndarray,
+                      y_err       : jnp.ndarray,
+                      starts      : dict,
+                      bounds      : tuple,
+                      use_scatter : bool,
+                      scatter_y_err: jnp.ndarray,
+                      maxiter     : int,
+                      delta_lim   : float,
+                      shift_lim   : float,
+                      ) -> SegmentState:
     """
-    One recentering iteration:
-      1. Apply current shift to x
-      2. Apply current mask to errors (padded/outlier points get huge errors)
-      3. Multi-start L-BFGS-B using loss_LSF (unchanged)
-      4. Estimate new centre using estimate_centre_anderson (uses build_LSF_GP)
-      5. Update shift and outlier mask using get_residuals (uses build_LSF_GP)
+    One recentering iteration. Body of lax.fori_loop.
+
+    use_scatter is a static bool (resolved at trace time).
+    scatter_y_err is the pre-rescaled Y_err when use_scatter=True,
+    or the original Y_err when use_scatter=False.
+    This avoids calling rescale_errors inside the loop.
+
+    No if/else anywhere — all branching via jnp.where or static bools.
     """
-    # Step 1: apply shift — recentering is done by shifting x
-    x_shifted = x + state.shift
+    # When already converged: body is a no-op via jnp.where on all outputs
+    # This replaces the 'break' in model_1s — lax.fori_loop has no break
 
-    # Step 2: apply mask to errors so padded/outlier points are invisible
-    y_err_masked = jnp.where(state.mask > 0.5, yerr, 1e9)
+    # Step 1: apply cumulative shift; clamp runaway (replaces np.abs(shift)>1 check)
+    safe_shift  = jnp.where(jnp.abs(state.shift) > 1.0,
+                             jnp.sign(state.shift) * 0.25,
+                             state.shift)
+    x_shifted   = x + safe_shift
 
-    # Step 3: multi-start optimisation — vmap over starts axis
-    def run_one(p0):
-        return _run_one_start(p0, x_shifted, y, y_err_masked,
-                              bounds, scatter, maxiter)
+    # Step 2: inflate errors for masked points (replaces keep_jm1 indexing)
+    # use scatter_y_err which is already rescaled if use_scatter=True
+    y_err_active = jnp.where(state.mask > 0.5, scatter_y_err, 1e9)
 
-    all_params, all_losses = jax.vmap(run_one)(starts)
-    best_idx    = jnp.argmin(all_losses)
-    best_params = jax.tree_util.tree_map(lambda a: a[best_idx], all_params)
+    # Step 3: multi-start L-BFGS-B
+    # vectorized_run_lsf_optimization_local vmaps over starts axis
+    params_batched, losses_batched = vectorized_run_lsf_optimization_local(
+        starts, x_shifted, y, y_err_active, use_scatter, bounds
+    )
+    best_idx   = jnp.argmin(losses_batched)
+    new_params = jax.tree_util.tree_map(lambda a: a[best_idx], params_batched)
 
-    # Step 4: estimate centre using estimate_centre_anderson (uses build_LSF_GP)
-    # Note: estimate_centre_anderson is not JAX-traceable (uses scipy brentq
-    # internally in some variants) so we use the anderson variant which uses
-    # only jax.grad and is traceable.
+    # Step 4: estimate centre via anderson method (uses build_LSF_GP internally)
     shift_j, _ = estimate_centre_anderson(
-        x_shifted, y, y_err_masked, best_params, scatter
+        x_shifted, y, y_err_active, new_params,
+        # use_scatter=use_scatter, 
     )
-    shift_j   = jnp.clip(jnp.array(shift_j), -1.0, 1.0)
-    new_shift  = state.shift + shift_j
+    # Replace: if not np.isfinite(shift_j) → jnp.where
+    shift_j = jnp.where(jnp.isfinite(shift_j), shift_j, 0.0)
+    # Clamp runaway shifts
+    shift_j = jnp.clip(shift_j, -1.0, 1.0)
 
-    # Step 5: update outlier mask using get_residuals (uses build_LSF_GP)
-    new_mask = _update_mask_from_residuals(
-        x_shifted, y, y_err_masked, best_params, state.mask, scatter
-    )
+    new_shift = safe_shift + shift_j
 
+    # Step 5: update outlier mask (replaces hf.is_outlier_original)
+    rsd      = get_residuals(x_shifted, y, y_err_active, new_params)
+    new_mask = _sigma_clip_mask(rsd, state.mask)
+
+    # Step 6: convergence check — stored as bool, replaces 'break'
     new_delta      = jnp.abs(shift_j - state.shift_prev)
     new_delta_prev = state.delta
-
-    return LoopState(
-        params     = best_params,
-        shift      = new_shift,
-        mask       = new_mask,
-        delta      = new_delta,
-        delta_prev = new_delta_prev,
-        shift_prev = jnp.array(shift_j),
+    oscillating    = (new_delta == state.delta_prev)
+    converged_now  = (
+        (new_delta          < delta_lim) |
+        (jnp.abs(new_shift) < shift_lim) |
+        oscillating
     )
+    new_converged = state.converged | converged_now
+
+    # Step 7: no-op when converged — jnp.where selects old vs new
+    # This is the JAX equivalent of 'break': zero extra compute after convergence
+    def sel(new_val, old_val):
+        return jnp.where(state.converged, old_val, new_val)
+
+    return SegmentState(
+        params     = jax.tree_util.tree_map(sel, new_params,  state.params),
+        shift      = sel(new_shift,      state.shift),
+        mask       = sel(new_mask,       state.mask),
+        delta      = sel(new_delta,      state.delta),
+        delta_prev = sel(new_delta_prev, state.delta_prev),
+        shift_prev = sel(shift_j,        state.shift_prev),
+        converged  = new_converged,
+    )
+
+
+def fit_segment_phase(x           : jnp.ndarray,   # (max_len,)
+                      y           : jnp.ndarray,
+                      y_err       : jnp.ndarray,   # original errors
+                      mask        : jnp.ndarray,   # 1=real, 0=padded
+                      starts      : dict,           # each leaf (num_starts,)
+                      bounds      : tuple,
+                      use_scatter : bool,           # STATIC — resolved at trace time
+                      scatter_y_err: jnp.ndarray,  # rescaled errors (=y_err if no scatter)
+                      numiter     : int = 5,
+                      maxiter     : int = 300,
+                      delta_lim   : float = 1e-3,
+                      shift_lim   : float = 1e-3,
+                      ) -> SegmentState:
+    """
+    One phase of the iterative fit (either Phase 1 or Phase 2).
+    use_scatter is static — JAX compiles a different graph for each phase.
+
+    scatter_y_err: pre-computed rescaled errors passed in from outside the loop.
+    This is the key design decision: rescale_errors (which calls build_scatter_GP
+    and gp.condition) is NOT inside the lax.fori_loop. It runs once at Python
+    level before the loop starts, then the rescaled errors are passed in as
+    a fixed array. This keeps the loop body pure and vmappable.
+    """
+    init_state = SegmentState(
+        params     = jax.tree_util.tree_map(lambda s: s[0], starts),
+        shift      = jnp.array(0.0),
+        mask       = mask,
+        delta      = jnp.array(jnp.inf),
+        delta_prev = jnp.array(jnp.inf),
+        shift_prev = jnp.array(0.0),
+        converged  = jnp.array(False),
+    )
+
+    body = functools.partial(
+        _recentering_iter,
+        x            = x,
+        y            = y,
+        y_err        = y_err,
+        starts       = starts,
+        bounds       = bounds,
+        use_scatter  = use_scatter,
+        scatter_y_err= scatter_y_err,
+        maxiter      = maxiter,
+        delta_lim    = delta_lim,
+        shift_lim    = shift_lim,
+    )
+
+    return jax.lax.fori_loop(0, numiter, body, init_state)
+
+
+def make_phase_fitter(use_scatter : bool,
+                      numiter     : int = 5,
+                      maxiter     : int = 300,
+                      ) -> callable:
+    """
+    Returns a jit+vmap compiled fitter for one phase.
+    use_scatter is baked into the compiled graph at construction time.
+
+    Two separate compiled functions are created:
+        phase1_fitter = make_phase_fitter(use_scatter=False)
+        phase2_fitter = make_phase_fitter(use_scatter=True)
+
+    Signature:
+        fitter(x, y, y_err, mask, starts, bounds, scatter_y_err)
+            -> SegmentState  (all fields batched over N_seg)
+    """
+    def _wrapper(x, y, y_err, mask, starts, bounds, scatter_y_err):
+        return fit_segment_phase(
+            x, y, y_err, mask, starts, bounds,
+            use_scatter   = use_scatter,   # static — baked in
+            scatter_y_err = scatter_y_err,
+            numiter       = numiter,
+            maxiter       = maxiter,
+        )
+
+    vmapped = jax.vmap(_wrapper, in_axes=(0, 0, 0, 0, 0, 0, 0))
+    return jax.jit(vmapped)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scatter training across a batch of segments (CPU, between phases)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_scatter_batch(x_batch      : jnp.ndarray,   # (N_seg, max_len)
+                        y_batch      : jnp.ndarray,
+                        y_err_batch  : jnp.ndarray,
+                        mask_batch   : jnp.ndarray,
+                        params_batch : dict,           # each leaf (N_seg, ...)
+                        minpts       : int = 15,
+                        ) -> tuple[list, jnp.ndarray]:
+    """
+    Train scatter GP for each segment using Phase 1 results.
+    Runs on CPU — train_scatter_tinygp uses scipy (not vmappable).
+    Returns:
+        scatter_list    : list of scatter tuples, one per segment
+        scatter_y_err   : (N_seg, max_len) rescaled errors for Phase 2
+    """
+    N_seg          = x_batch.shape[0]
+    scatter_list   = []
+    scatter_y_err  = np.array(y_err_batch)   # will be filled in-place
+
+    for i in range(N_seg):
+        # Extract this segment's data (unpadded points only)
+        good   = np.array(mask_batch[i]) > 0.5
+        x_i    = np.array(x_batch[i]   [good])
+        y_i    = np.array(y_batch[i]   [good])
+        ye_i   = np.array(y_err_batch[i][good])
+        theta_i = jax.tree_util.tree_map(lambda a: a[i], params_batch)
+
+        try:
+            scatter_i = train_scatter_tinygp(
+                x_i, y_i, ye_i, theta_i, minpts=minpts
+            )
+            scatter_list.append(scatter_i)
+
+            # Rescale errors for Phase 2 — only for good (unpadded) points
+            S_i, _ = rescale_errors(scatter_i, jnp.array(x_i), jnp.array(ye_i))
+            scatter_y_err[i][good] = np.array(S_i)
+
+        except Exception as e:
+            # Scatter training failed — fall back to original errors
+            scatter_list.append(None)
+            # scatter_y_err[i] already holds original y_err
+
+    return scatter_list, jnp.array(scatter_y_err)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def make_dummy_scatter(X):
@@ -604,53 +851,50 @@ def get_scatter_covar(X,Y,Y_err,theta_lsf):
 
 
 def rescale_errors(use_scatter : bool,
-                   scatter,
+                   scatter : list | tuple,
                    X : jnp.ndarray,
                    Y_err : jnp.ndarray
-                   ):
+                   ) -> tuple[jnp.ndarray, jnp.ndarray]:
     '''
-    Performs error rescaling, as determined by the scatter parameters
-
-    Parameters
-    ----------
-    scatter : TYPE
-        DESCRIPTION.
-    X : TYPE
-        DESCRIPTION.
-    Y_err : TYPE
-        DESCRIPTION.
-    plot : TYPE, optional
-        DESCRIPTION. The default is False.
-
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
-
+    JAX-compatible error rescaling.
+    
+    use_scatter : static bool — resolved at trace time
+    scatter     : [theta_scatter, logvar_x, logvar_y, logvar_err]
+                  or [] when not used
+    
+    When use_scatter=False, returns Y_err unchanged with zero variance.
+    When use_scatter=True, rescales Y_err using the scatter GP.
+    
+    Both branches are always computed (JAX requirement for jnp.where),
+    but the static use_scatter flag means only one branch is ever
+    included in the compiled graph — so there is zero runtime cost
+    for the unused branch.
     '''
-    
-    
-    
-    # Always unpack (scatter must always exist!)
-    theta_scatter, logvar_x, logvar_y, logvar_err = scatter
-    
-    # Always compute scatter GP
-    sct_gp        = build_scatter_GP(theta_scatter,logvar_x,logvar_err)
-    _, sct_cond   = sct_gp.condition(logvar_y,X)
-    F_mean  = sct_cond.mean
-    F_sigma = jnp.sqrt(sct_cond.variance)
-    
-    S_scatter, S_var_scatter = transform(X,Y_err,F_mean,F_sigma,sct_gp,logvar_y)
-    
-    # Define "no scatter" behavior
-    S_noscatter = Y_err
-    S_var_noscatter = jnp.zeros_like(Y_err)
+    use_scatter = bool(use_scatter)
+    # Branch 1: no scatter — identity, zero variance
+    S_no_scatter    = Y_err
+    S_var_no_scatter = jnp.zeros_like(Y_err)
 
-    # Blend results (THIS is the key trick)
-    S     = jnp.where(use_scatter, S_scatter, S_noscatter)
-    S_var = jnp.where(use_scatter, S_var_scatter, S_var_noscatter)
+    # Branch 2: scatter rescaling — always computed when use_scatter=True
+    if use_scatter:
+        theta_scatter, logvar_x, logvar_y, logvar_err = scatter
+        sct_gp        = build_scatter_GP(theta_scatter, logvar_x, logvar_err)
+        _, sct_cond   = sct_gp.condition(logvar_y, X)
+        F_mean        = sct_cond.mean
+        F_sigma       = jnp.sqrt(sct_cond.variance)
+        # S_scatter     = Y_err * jnp.exp(F_mean / 2.)
+        # deriv         = jax.grad(
+        #     lambda x: sct_gp.condition(logvar_y, jnp.atleast_1d(x))[1].mean[0]
+        # )
+        # dFdx          = jax.vmap(deriv)(X)
+        # S_var_scatter = jnp.square(S_scatter / 2. * dFdx * F_sigma)
+        S_scatter, S_var_scatter = transform(X,Y_err,F_mean,F_sigma,sct_gp,logvar_y)
+    else:
+        S_scatter     = S_no_scatter
+        S_var_scatter = S_var_no_scatter
+
+    return S_scatter, S_var_scatter
     
-    return S, S_var
 
 def plot_variance_GP(scatter,X,Y_err,plot=False,ax=None):
     theta_scatter, logvar_x, logvar_y, logvar_err = scatter
@@ -847,9 +1091,10 @@ def build_LSF_GP(theta_lsf : dict,
                  X : jnp.ndarray,
                  # Y : jnp.ndarray = None,
                  Y_err : jnp.ndarray,
-                 use_yerr : bool = False,
+                 # use_yerr : bool = False,
+                 use_scatter = False,
                  scatter : list = [], 
-                 use_scatter = False):
+                 ) -> tinygp.GaussianProcess:
     '''
     Returns a Gaussian Process for the LSF. If scatter is not None, tries to 
     include a second GP for the intrinsic scatter of datapoints beyond the
@@ -872,6 +1117,7 @@ def build_LSF_GP(theta_lsf : dict,
         DESCRIPTION.
 
     '''
+    use_scatter = bool(use_scatter)
     gp_amp   = jnp.exp(theta_lsf['gp_log_amp'])
     gp_scale = jnp.exp(theta_lsf["gp_log_scale"])
     kernel = gp_amp * tinygp.kernels.ExpSquared(gp_scale) # LSF kernel
@@ -881,18 +1127,17 @@ def build_LSF_GP(theta_lsf : dict,
     S, S_var = rescale_errors(use_scatter, scatter, X, Y_err)
     var_data  = jnp.square(S)
     var_tot = var_data + var_add
-    noise2d = jnp.diag(var_tot) #+ (1 - mask) * 1e18
-    
+    # noise2d = jnp.diag(var_tot) #+ (1 - mask) * 1e18
     
     return tinygp.GaussianProcess(
         kernel,
         X,
-        noise = noise2d,
+        noise = jnp.diag(var_tot),
         mean=functools.partial(gaussian_mean_function, theta_lsf),
     )
 
 def estimate_centre_numerically(X,Y,Y_err,LSF_solution,scatter=None,N=10):
-    gp = build_LSF_GP(LSF_solution,X,Y,Y_err,scatter)
+    gp = build_LSF_GP(LSF_solution,X,Y_err,scatter)
     rng_key = jax.random.PRNGKey(1234)
     X_grid  = jnp.linspace(-1,1,100)
     _, cond = gp.condition(Y,X_grid)
@@ -914,7 +1159,7 @@ def estimate_centre(X,Y,Y_err,LSF_solution,scatter=None,N=10):
         bisect = jaxopt.Bisection(derivative_,-1.,1.)#,gp=gp,Y=Y,rng_key=rng_key)
         return bisect.run().params
     
-    gp = build_LSF_GP(LSF_solution,X,Y,Y_err,scatter)
+    gp = build_LSF_GP(LSF_solution,X,Y_err,scatter)
     X_grid  = jnp.linspace(-1,1,100)
     _, cond = gp.condition(Y,X_grid)
     
@@ -928,7 +1173,7 @@ def estimate_centre(X,Y,Y_err,LSF_solution,scatter=None,N=10):
     del(centres); del(X_grid); del(cond)
     gc.collect()
     return -mean, sigma
-def estimate_centre_anderson(X,Y,Y_err,LSF_solution,scatter=None):
+def estimate_centre_anderson(X,Y,Y_err,LSF_solution):
     
     def value_(x):
         _, cond = gp.condition(Y,jnp.array([x]))
@@ -938,21 +1183,24 @@ def estimate_centre_anderson(X,Y,Y_err,LSF_solution,scatter=None):
         # return jax.grad(partial(value_,gp=gp,Y=Y,rng_key=rng_key))(x)
         return jax.grad(value_)(x)
     # @jit
-    gp = build_LSF_GP(LSF_solution,X,Y,Y_err,scatter)
+    gp = build_LSF_GP(LSF_solution,X,Y_err, use_scatter=False,
+                      scatter = [])
     
     vn = value_(-0.5)
     vp = value_(+0.5)
     dn = derivative_(-0.5)
     dp = derivative_(+0.5)
-    shift = (vp - vn)/(dp - dn)
-    if not np.isfinite(shift):
-        shift=np.random.normal(0,0.005)
+    shift_raw = (vp - vn)/(dp - dn)
+    
+    
+    shift = jnp.where(jnp.isfinite(shift_raw), shift_raw, jnp.array(0.0))
     
     return shift, 0.
+
 def estimate_centre_median(X,Y,Y_err,LSF_solution,scatter=None):
     from scipy.special import erfinv
     
-    gp = build_LSF_GP(LSF_solution,X,Y,Y_err,scatter)
+    gp = build_LSF_GP(LSF_solution,X,Y_err,scatter)
     y = jnp.linspace(-1.0+1e-7, 1.0-1e-7, num=500)
     X_grid_ = jnp.sort(erfinv(y))
     sampled_Xrange = X_grid_.max() - X_grid_.min()
@@ -990,7 +1238,7 @@ def estimate_centre_median(X,Y,Y_err,LSF_solution,scatter=None):
     return shift, 0.
 
 def estimate_centre_centroid(X,Y,Y_err,LSF_solution,scatter=None):
-    gp = build_LSF_GP(LSF_solution,X,Y,Y_err,scatter)
+    gp = build_LSF_GP(LSF_solution,X,Y_err,scatter)
     
     X_grid   = jnp.linspace(X.min(),X.max(),1000)
     _, cond  = gp.condition(Y,X_grid)
@@ -999,7 +1247,7 @@ def estimate_centre_centroid(X,Y,Y_err,LSF_solution,scatter=None):
     return shift, 0.
 
 def estimate_centre_mean(X,Y,Y_err,LSF_solution,scatter=None):
-    gp = build_LSF_GP(LSF_solution,X,Y,Y_err,scatter)
+    gp = build_LSF_GP(LSF_solution,X,Y_err,scatter)
     X_grid   = jnp.linspace(X.min(),X.max(),1000)
     _, cond  = gp.condition(Y,X_grid)
     mean_lsf = cond.mean

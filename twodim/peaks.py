@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+peaks.py
+
 Created on Thu Apr 24 14:18:16 2025
 
 @author: dmilakov

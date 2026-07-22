@@ -1,7 +1,9 @@
 {
-  "results_fits_file": "/Users/dmilakov/projects/lfc/dataprod/twodim/HARPS.2015-04-17T00:00:41.445_lfc_red_zernike_results2.fits",
-  "lfc_source_file": "/Users/dmilakov/projects/lfc/data/harps/raw/4bruce/HARPS.2015-04-17T00:00:41.445_lfc.fits",
+  "results_fits_file": "/Users/dmilakov/projects/spectroperf/dataprod/analysis_output/HARPS.2018-12-05T08:12:52.040_lfc_red_zernike_results.fits",
+  "lfc_source_file": "/Users/dmilakov/projects/spectroperf/data/harps/lfc/HARPS.2018-12-05T08:12:52.040.fits",
   "bias_file": null,
+  "detector": "red",
+  "output_dir": "/Users/dmilakov/projects/spectroperf/dataprod/analysis_output/HARPS.2018-12-05T08_12_52.040/",
   "target": {
     "order": 20,
     "image": "A",
@@ -25,7 +27,7 @@
   "plot_settings": {
     "save_plots": true,
     "plot_format": "pdf",
-    "plot_dir": "./single_stamp_plots_output2/",
+    "plot_dir": "/Users/dmilakov/projects/spectroperf/dataprod/analysis_output/HARPS.2018-12-05T0812/single_stamp_plots_output/",
     "no_plots": false,
     "posteriors": {"enable": true},
     "corner": {"enable": true}

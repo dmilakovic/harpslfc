@@ -306,7 +306,7 @@ class BayesianStampFitter:
         if init_strategy == 'uniform': init_func = init_to_uniform
         elif init_strategy == 'median': init_func = init_to_median
         elif init_strategy == 'mean': init_func = init_to_mean
-        elif init_strategy == 'prior': init_func = init_to_prior
+        # elif init_strategy == 'prior': init_func = init_to_prior
         else:
             warnings.warn(f"Invalid init_strategy '{init_strategy}'. Using default 'uniform'.")
             init_strategy = 'uniform'

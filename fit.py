@@ -29,7 +29,11 @@ from scipy.optimize import least_squares, OptimizeWarning
 
 import warnings
 
-
+try:
+    from numpy.exceptions import RankWarning
+except ImportError:
+    from numpy import RankWarning  # NumPy < 2.0
+    
 quiet = hs.quiet
 version = hs.version
 #==============================================================================
@@ -400,7 +404,7 @@ def ordinary(centers,wavelengths,cerror,werror,polyord):
     assert numcen>polyord, "No. centers too low, {}".format(numcen)
     # beta0 is the initial guess
     with warnings.catch_warnings():
-        warnings.filterwarnings('ignore',category=np.RankWarning)
+        warnings.filterwarnings('ignore',category=RankWarning)
         beta0 = np.flip(np.polyfit(centers,wavelengths,polyord,cov=False))
     data  = odr.RealData(centers,wavelengths,sx=cerror,sy=werror)
     model = odr.polynomial(order=polyord)
@@ -418,12 +422,12 @@ def poly(polytype,centers,wavelengths,cerror,werror,polyord):
     assert polytype in ['ordinary','legendre']
     if polytype=='ordinary':
         with warnings.catch_warnings():
-            warnings.filterwarnings('ignore',category=np.RankWarning)
+            warnings.filterwarnings('ignore',category=RankWarning)
             beta0 = np.flip(np.polyfit(centers,wavelengths,polyord,cov=False))
         model = odr.polynomial(order=polyord)
     if polytype=='legendre':
         with warnings.catch_warnings():
-            warnings.filterwarnings('ignore',category=np.RankWarning)
+            warnings.filterwarnings('ignore',category=RankWarning)
             beta0 = leg.legfit(centers,wavelengths,polyord,full=False)
         model = odr.Model(legval)
     data  = odr.RealData(centers,wavelengths,sx=cerror,sy=werror)
@@ -601,10 +605,15 @@ def segment(centers,wavelengths,cerror,werror,polyord,polytype,xmin,xmax,
     
     
     arenan = np.isnan(centers)
+    x_span = (xmax - xmin) / 2.0
+    
+    
     centers     = hf.contract(centers[~arenan],(xmin,xmax))
     wavelengths = wavelengths[~arenan]
-    cerror      = hf.contract(cerror[~arenan],(xmin,xmax))
+    cerror      = cerror[~arenan] / x_span
     werror      = werror[~arenan]
+    logger.debug(f'segment: xmin={xmin}, xmax={xmax}, centers range [{centers.min():.4f}, {centers.max():.4f}]')
+    logger.debug(f'segment: cerror range [{cerror.min():.4e}, {cerror.max():.4e}]')
 #    if plot:
 #        plt.figure()
 #        plt.errorbar(centers,wavelengths,yerr=werror,xerr=cerror,ms=2,ls='',capsize=4)
@@ -628,17 +637,26 @@ def segment(centers,wavelengths,cerror,werror,polyord,polytype,xmin,xmax,
         werror0      = werror[clip0]
         
         try:
-            model        = poly(polytype,centers0,wavelengths0,cerror0,werror0,
-                                polyord)
-            success      = True
-            # print([np.shape(array) for array in [clip0]])
-        except:
-            success      = False
+            model = poly(polytype, centers0, wavelengths0, cerror0, werror0, polyord)
+            success = True
+        except AssertionError as e:
+            logger.warning(f'segment: assertion failed at iter {j}: {e}')
+            logger.warning(f'  numcen={len(centers0)}, polyord={polyord}, polytype={polytype!r}')
+            success = False
+        except Exception as e:
+            logger.warning(f'segment: ODR failed at iter {j}: {type(e).__name__}: {e}')
+            logger.warning(f'  centers range [{centers0.min():.4f}, {centers0.max():.4f}], n={len(centers0)}')
+            logger.warning(f'  cerror range [{cerror0.min():.4e}, {cerror0.max():.4e}]')
+            success = False
             
             
         if success:
-            pars         = model.beta
-            errs         = model.sd_beta
+            pars   = model.beta
+            errs   = model.sd_beta
+            if not np.all(np.isfinite(pars)) or not np.all(np.isfinite(errs)):
+                logger.warning(f'segment: ODR returned non-finite pars/errs at iter {j}')
+                logger.warning(f'  pars={pars}, errs={errs}, res_var={model.res_var}')
+                success = False
             chisqnu      = model.res_var
             nu           = len(wavelengths0) - len(pars)
             chisq        = chisqnu * nu

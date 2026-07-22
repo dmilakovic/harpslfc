@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+This is harps.lsf submodule. 
+
 Created on Tue Jan 31 11:43:10 2023
 
 @author: dmilakov
