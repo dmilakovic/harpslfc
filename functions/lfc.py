@@ -35,15 +35,42 @@ def remove_bad_fits(linelist,fittype,limit=None,q=None):
     
     field  = '{}_err'.format(fittype)
     values = linelist[field][:,1]
-    
+
+    n_finite = np.sum(np.isfinite(values))
+    if n_finite == 0:
+        raise ValueError(
+            f"remove_bad_fits: every value in '{field}' is non-finite (NaN/inf). "
+            f"'{field}' <= limit is False for ANY limit when "
+            f"the values are NaN, so the retry loop below would never terminate "
+            f"— this used to hang forever instead of raising. If '{fittype}' "
+            f"centres come from a fit that doesn't produce a per-line "
+            f"uncertainty (e.g. the JAX/LBFGSB line fit, which currently "
+            f"leaves *_err as NaN), fix it at the source rather than here: "
+            f"either supply a real uncertainty estimate, or call this with "
+            f"a fittype whose _err field is actually populated."
+        )
+
     keep   = np.where(values<=limit)[0]
     frac   = len(keep)/len(values)
     # if fraction of kept lines is smaller than some limit q (e.g. 90%)
     # increase the limit such to remove the worst (1-q) percent of the lines
+    max_iter = 100_000  # second line of defense: fail loudly, don't hang,
+                        # even if some other future case again makes frac
+                        # unable to reach q.
+    n_iter = 0
     while frac<q:
         limit  += 0.001
         keep   = np.where(values<=limit)[0]
         frac   = len(keep)/len(values)
+        n_iter += 1
+        if n_iter > max_iter:
+            raise RuntimeError(
+                f"remove_bad_fits: failed to reach the target kept-fraction "
+                f"q={q} after {max_iter} iterations (limit grew to {limit:.3f}, "
+                f"still only keeping {frac:.1%}). {n_finite}/{len(values)} "
+                f"values in '{field}' are finite — this looks like a real "
+                f"data problem, not just a slow convergence."
+            )
     logger=logging.getLogger(__name__)
     N      = len(values)
     K      = len(keep)
@@ -206,4 +233,3 @@ def expand(x_contracted,xrange):
     x_mid  = np.average(xrange)
     x_span = (np.diff(xrange))/2
     return x_contracted * x_span + x_mid
-

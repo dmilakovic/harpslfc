@@ -126,7 +126,7 @@ def smoke_test(order=41, numseg=4, iter_center=3, overwrite=False):
 def run_production(orders, start=1, stop=1, numseg=16, scale='both',
                    interpolate=True, model_scatter=True,
                    wavesol_version=700, plot=False, save_plot=False,
-                   overwrite=False, run_solve=True):
+                   overwrite=False, run_solve=True, skip_construction=False):
     """
     The actual ESPRESSO LSF construction — mirrors construct_from_args()
     in construct_lsf_ESPRESSO.py.
@@ -140,16 +140,25 @@ def run_production(orders, start=1, stop=1, numseg=16, scale='both',
     scale : 'pixel', 'velocity', or 'both'
     run_solve : bool
         Whether to call aux.solve(...) after each iteration (this updates
-        the linelist with LSF-based fits). NOT independently re-verified
-        in this fix pass — set False if you only want the LSF itself and
-        want to isolate any remaining issues to aux.solve.
+        the linelist with LSF-based fits).
+    skip_construction : bool
+        If True, skip from_spectrum_2d entirely for every iteration and go
+        straight to aux.solve(), using whatever LSF a PRIOR run already
+        wrote to lsf_filepath for that iteration/version. Before calling
+        solve(), this is validated with aux.lsf_exists_for_version() —
+        checking that real (non-default, finite-y) LSF rows actually exist
+        for every requested order, not just that the extension is present —
+        and raises a clear error immediately if not, rather than silently
+        proceeding into solve()'s per-order "no valid LSF model" warnings.
     """
     import harps.lsf.construct as construct
     import harps.lsf.aux as aux
     import harps.inout as hio
+    import harps.version as hv
 
     logger.info(f"=== PRODUCTION RUN: orders={orders}, iterations={start}..{stop}, "
-               f"numseg={numseg}, scale={scale}, model_scatter={model_scatter} ===")
+               f"numseg={numseg}, scale={scale}, model_scatter={model_scatter}, "
+               f"skip_construction={skip_construction} ===")
 
     spec = _load_spectrum(overwrite=overwrite)
     lsf_filepath = hio.get_fits_path('lsf', spec.filepath)
@@ -158,25 +167,50 @@ def run_production(orders, start=1, stop=1, numseg=16, scale='both',
     results = {}
 
     for it in range(start, stop + 1):
-        for sc in scales:
-            logger.info(f"--- iteration {it}, scale={sc} ---")
-            lsf2d = construct.from_spectrum_2d(
-                spec,
-                orders=orders,
-                iteration=it,
-                scale=sc,
-                iter_center=20,
-                numseg=numseg,
-                wavesol_version=wavesol_version,
-                model_scatter=model_scatter,
-                interpolate=interpolate,
-                save_fits=True,
-                clobber=False,
-                plot=plot,
-                save_plot=save_plot,
-                update_linelist=False,
+        if skip_construction:
+            version = hv.item_to_version(
+                dict(iteration=it, model_scatter=model_scatter, interpolate=interpolate),
+                ftype='lsf',
             )
-            results[(it, sc)] = lsf2d
+            logger.info(f"--- iteration {it}: --skip-construction set, reusing "
+                       f"existing LSF (version={version}) ---")
+            report = aux.lsf_exists_for_version(lsf_filepath, version, orders,
+                                                scales=tuple(scales))
+            problems = [f"  {sc}: {rep['reason']}"
+                       for sc, rep in report.items() if not rep['ok']]
+            if problems:
+                raise RuntimeError(
+                    "--skip-construction requested, but no valid, previously-"
+                    f"fit LSF was found for iteration={it} (version={version}) "
+                    f"covering orders={orders}. Run once WITHOUT "
+                    "--skip-construction first, or check that --scatter/"
+                    "--interpolate match the run that produced the existing "
+                    f"LSF (version is derived from those flags).\n"
+                    + "\n".join(problems)
+                )
+            for sc, rep in report.items():
+                logger.info(f"    {sc}: {rep['n_valid']}/{rep['n_total']} segments "
+                           f"have finite LSF data for the requested orders.")
+        else:
+            for sc in scales:
+                logger.info(f"--- iteration {it}, scale={sc} ---")
+                lsf2d = construct.from_spectrum_2d(
+                    spec,
+                    orders=orders,
+                    iteration=it,
+                    scale=sc,
+                    iter_center=20,
+                    numseg=numseg,
+                    wavesol_version=wavesol_version,
+                    model_scatter=model_scatter,
+                    interpolate=interpolate,
+                    save_fits=True,
+                    clobber=False,
+                    plot=plot,
+                    save_plot=save_plot,
+                    update_linelist=False,
+                )
+                results[(it, sc)] = lsf2d
 
         if run_solve:
             logger.info(f"--- solving iteration {it} ---")
@@ -233,6 +267,21 @@ def main():
                         const=False, default=False)
     parser.add_argument('--no-solve', action='store_true',
                         help='Skip the aux.solve(...) step in --production.')
+    parser.add_argument('--skip-construction', action='store_true',
+                        help='Skip from_spectrum_2d and go straight to '
+                             'aux.solve(), reusing a PRIOR run\'s already-'
+                             'saved LSF for the same iteration/scatter/'
+                             'interpolate settings. Fails loudly if that '
+                             'LSF is not actually there and valid.')
+    parser.add_argument('--checksum-lsf-ref', type=str, default=None,
+                        help='Path to a reference LSF FITS file. After the '
+                             'run, compares the produced LSF file against '
+                             'it within --checksum-rtol and reports PASS/FAIL.')
+    parser.add_argument('--checksum-outpath-ref', type=str, default=None,
+                        help='Path to a reference S2D output FITS file '
+                             '(linelist/model_lsf). Compared the same way '
+                             'as --checksum-lsf-ref.')
+    parser.add_argument('--checksum-rtol', type=float, default=1e-6)
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -263,7 +312,35 @@ def main():
         save_plot=args.plot,
         overwrite=args.overwrite,
         run_solve=not args.no_solve,
+        skip_construction=args.skip_construction,
     )
+
+    if args.checksum_lsf_ref or args.checksum_outpath_ref:
+        import harps.inout as hio
+        from harps.lsf import checksum
+
+        spec = _load_spectrum(overwrite=False)
+        all_ok = True
+
+        if args.checksum_lsf_ref:
+            lsf_filepath = hio.get_fits_path('lsf', spec.filepath)
+            report = checksum.compare_fits_files(
+                args.checksum_lsf_ref, lsf_filepath, rtol=args.checksum_rtol
+            )
+            logger.info("--- checksum: LSF output vs reference ---")
+            print(report.summary())
+            all_ok = all_ok and report.ok
+
+        if args.checksum_outpath_ref:
+            report = checksum.compare_fits_files(
+                args.checksum_outpath_ref, spec._outpath, rtol=args.checksum_rtol
+            )
+            logger.info("--- checksum: S2D output vs reference ---")
+            print(report.summary())
+            all_ok = all_ok and report.ok
+
+        if not all_ok:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

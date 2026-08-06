@@ -478,13 +478,11 @@ def dispersion(linelist,version,fittype,npix,errorfac=1,polytype='ordinary',
             print('No lines found')
             continue
         linelis1d = hf.remove_bad_fits(linelis1d_dirty,fittype,limit=limit,q=q)
-        
         centers1d = linelis1d[fittype][:,1]
         
         if np.sum(centers1d) ==0:
-            # print(f"No lines to fit in order {order}")
+            print(f"No lines to fit in order {order}")
             continue
-        
         cerrors1d = errorfac*linelis1d[f'{fittype}_err'][:,1]
         wavelen1d = hf.freq_to_lambda(linelis1d['freq']+anchor_offset)
         werrors1d = 1e10*(c/((linelis1d['freq'])**2)) * freq_err

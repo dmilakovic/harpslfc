@@ -14,6 +14,7 @@ import harps.functions.spectral as specfunc
 
 import harps.containers as container
 import harps.lsf.fit as hlsfit
+import harps.lsf.fit_jax as hfjax
 import harps.version as hv
 import harps.progress_bar as progress_bar
 import harps.lines_aux as laux
@@ -21,6 +22,7 @@ import harps.settings as hs
 import harps.wavesol as ws
 
 import gc
+import os
 import numpy as np
 import harps.lsf.inout as io
 import hashlib
@@ -29,9 +31,6 @@ import logging
 import jax
 import jax.numpy as jnp
 import time
-import multiprocessing
-import copy
-from   functools import partial
 import traceback
 import ray
 
@@ -232,7 +231,7 @@ def stack_spectrum(spec,version,wavesol_version,orders=None,subbkg=hs.subbkg,div
                                **kwargs) 
 
 def _prepare_lsf1s(n_data,n_sct,pars):
-    lsf1s = get_empty_lsf(1,n_data,n_sct,pars)#[0]
+    lsf1s = get_empty_lsf(1,n_data,n_sct,pars)[0]
     return lsf1s
 
 def _calculate_shift(y,x):
@@ -885,332 +884,410 @@ def read_outfile4solve(out_filepath,version,scale):
     return x2d,flx2d,err2d,env2d,bkg2d,linelist
  
 
+def _pad_lines_for_order(indices, linelist, x2d, flx2d, err2d, od):
+    """
+    Gathers all lines belonging to order `od` into padded (n_lines, max_len)
+    arrays plus a boolean mask, and the small per-line arrays (bary, order
+    position) needed to write results back afterwards.
+    """
+    n_lines = len(indices)
+    pixl = linelist['pixl'][indices]
+    pixr = linelist['pixr'][indices]
+    bary = linelist['bary'][indices]
+    lengths = pixr - pixl
+    max_len = int(np.max(lengths)) if n_lines > 0 else 0
+
+    x1l_batch = np.zeros((n_lines, max_len))
+    flx1l_batch = np.zeros((n_lines, max_len))
+    err1l_batch = np.ones((n_lines, max_len))
+    mask_batch = np.zeros((n_lines, max_len), dtype=bool)
+
+    for k in range(n_lines):
+        n = lengths[k]
+        x1l_batch[k, :n] = x2d[od, pixl[k]:pixr[k]]
+        flx1l_batch[k, :n] = flx2d[od, pixl[k]:pixr[k]]
+        err1l_batch[k, :n] = err2d[od, pixl[k]:pixr[k]]
+        mask_batch[k, :n] = True
+
+    return x1l_batch, flx1l_batch, err1l_batch, mask_batch, bary
+
+
+def _lsf1s_arrays_for_order(LSF1d_obj):
+    """
+    Pulls the shared x-grid, per-segment centres, and per-segment y-curves
+    out of an LSF1d object for one order, ready for fit_jax.fit_lines_batch.
+    Returns None if this order has no LSF data (LSF2d_nm[od] returned None,
+    or the LSF1d object is empty) — caller must handle that.
+    """
+    if LSF1d_obj is None or len(LSF1d_obj) == 0:
+        return None
+    values = LSF1d_obj.values
+    x_grid = np.asarray(values['x'][0], dtype=float)
+    segment_Y = np.asarray(np.stack([values['y'][i] for i in range(len(values))]), dtype=float)
+    segment_centres = (np.asarray(values['ledge'], dtype=float)
+                       + np.asarray(values['redge'], dtype=float)) / 2.0
+    return x_grid, segment_centres, segment_Y
+
+
 @ray.remote
-def solve_1d(indices, linelist, x2d, flx2d, err2d, LSF2d_nm, **kwargs):
+def solve_order_jax(od, indices, linelist_arr, x2d, flx2d, err2d, LSF1d_obj,
+                    scale='pixel', N=2, maxiter=200, npars=3):
     """
-    Ray Task: Processes all lines within a specific echelle order.
-    'indices' is a 1D array of row indices in the linelist for one order.
+    Ray task: fits every line in one echelle order in a single batched,
+    JAX-native call (see harps.lsf.fit_jax). Replaces the old per-line
+    scipy dispatch (solve_line / LineSolver) at the granularity that
+    matches how the LSF itself is organised (per order, per segment).
+
+    Returns
+    -------
+    indices : the same indices passed in (so the caller can write results
+        back to the right rows without re-deriving them)
+    updated_rows : linelist rows for `indices`, with lsf_{scl}* fields filled
+    models : list of per-line model arrays (unpadded, one per line), for
+        writing to the 'model_lsf' FITS extension
     """
-    results = []
-    # Process lines in this batch serially to avoid nested deadlocks
-    for idx in indices:
-        # solve_line handles its own logging if logger=None
-        res = solve_line(idx, linelist, x2d, flx2d, err2d, LSF2d_nm, **kwargs)
-        results.append(res)
-    return results
-       
-def solve(out_filepath,lsf_filepath,iteration,order,force_version=None,
-          model_scatter=False,interpolate=False,scale=['pixel','velocity'],
-          npars = None,sOrder=None,
-          subbkg=hs.subbkg,divenv=hs.divenv,save2fits=True,logger=None):
-    from fitsio import FITS
-    from harps.lsf.container import LSF2d
-    
-    def bulk_fit(function):
-        manager = multiprocessing.Manager()
-        inq = manager.Queue()
-        outq = manager.Queue()
-    
-        # construct the workers
-        nproc = multiprocessing.cpu_count()
-        logger.info(f"Using {nproc} workers")
-        workers = [LineSolver(str(name+1), function,inq, outq) 
-                   for name in range(nproc)]
-        for worker in workers:
-            worker.start()
-    
-        # add data to the queue for processing
-        work_len = tot
-        for item in cut:
-            inq.put(item)
-    
-        while outq.qsize() != work_len:
-            # waiting for workers to finish
-            done = outq.qsize()
-            progress = done/(work_len-1)
+    logger = logging.getLogger(__name__).getChild('solve_order_jax')
+    scl = 'pix' if scale[:3] == 'pix' else 'wav'
+    rows = linelist_arr[indices].copy()
+
+    lsf_arrays = _lsf1s_arrays_for_order(LSF1d_obj)
+    if lsf_arrays is None:
+        logger.warning(f"Order {od}: no valid LSF model — {len(indices)} lines skipped.")
+        for row in rows:
+            row[f'lsf_{scl}'] = np.nan
+        models = [np.zeros(int(r['pixr'] - r['pixl'])) for r in rows]
+        return indices, rows, models
+
+    x_grid, segment_centres, segment_Y = lsf_arrays
+    x1l_b, flx1l_b, err1l_b, mask_b, bary_b = _pad_lines_for_order(
+        indices, linelist_arr, x2d, flx2d, err2d, od
+    )
+
+    pars, loss, Y_line = hfjax.fit_lines_batch(
+        jnp.array(x1l_b), jnp.array(flx1l_b), jnp.array(err1l_b), jnp.array(mask_b),
+        jnp.array(bary_b), jnp.array(x_grid), jnp.array(segment_centres),
+        jnp.array(segment_Y), scale=scale, N=N, maxiter=maxiter,
+    )
+    M_line = hfjax.natural_cubic_spline_M(jnp.array(x_grid), Y_line)
+    model_b, chisq, dof, integral = hfjax.compute_model_chisq(
+        pars, jnp.array(x_grid), Y_line, M_line,
+        jnp.array(x1l_b), jnp.array(flx1l_b), jnp.array(err1l_b), jnp.array(mask_b),
+        scale=scale,
+    )
+    errs = hfjax.estimate_param_errors(
+        pars, jnp.array(x_grid), Y_line, M_line,
+        jnp.array(x1l_b), jnp.array(flx1l_b), jnp.array(err1l_b), jnp.array(mask_b),
+        scale=scale,
+    )
+
+    amp = np.asarray(pars['amp'])
+    cen = np.asarray(pars['cen'])
+    wid = np.asarray(pars['wid'])
+    amp_err = np.asarray(errs['amp'])
+    cen_err = np.asarray(errs['cen'])
+    wid_err = np.asarray(errs['wid'])
+    chisq_np = np.asarray(chisq)
+    dof_np = np.asarray(dof)
+    integral_np = np.asarray(integral)
+    model_np = np.asarray(model_b)
+    mask_np = mask_b
+
+    models = []
+    for k, row in enumerate(rows):
+        n = int(row['pixr'] - row['pixl'])
+        row[f'lsf_{scl}'][:npars] = [amp[k], cen[k], wid[k]][:npars]
+        # Laplace/Gauss-Newton (inverse-Hessian-of-the-loss) per-parameter
+        # error, computed in fit_jax.estimate_param_errors. NaN for any line
+        # where the Hessian wasn't usable (e.g. a genuinely unconstrained
+        # parameter) rather than a fabricated number.
+        row[f'lsf_{scl}_err'][:npars] = [amp_err[k], cen_err[k], wid_err[k]][:npars]
+        chisqnu = chisq_np[k] / dof_np[k] if dof_np[k] > 0 else np.nan
+        row[f'lsf_{scl}_chisq'] = chisq_np[k]
+        row[f'lsf_{scl}_chisqnu'] = chisqnu
+        row[f'lsf_{scl}_integral'] = integral_np[k]
+        models.append(model_np[k, mask_np[k]])
+
+    return indices, rows, models
+
+
+def _dispatch_orders_checkpointed(orders, cut_, linelist, x2d, flx2d, err2d,
+                                  LSF2d_nm, out_filepath, version, scale,
+                                  N, maxiter, npars, logger):
+    """
+    Shared driver for one scale pass (pixel or velocity): puts the large
+    shared arrays into the Ray object store once, dispatches one task per
+    order, and writes each order's results to the output FITS file as soon
+    as that order's task completes (checkpointing — a crash partway through
+    loses at most one order's work, not the whole pass).
+
+    Mutates `linelist` in place (writes fitted columns for this scale) and
+    returns it.
+    """
+    # model_lsf must be scale-specific: 'pixel' and 'velocity' passes fit
+    # against different x-domains (raw pixel index vs lsf_wavesol's
+    # wavelength/velocity values), so their reconstructed model curves are
+    # not comparable and must not share a HDU. Without this, whichever
+    # pass runs last (velocity, since solve() always does pixel first)
+    # silently overwrote the other pass's model at the same (order, pixl)
+    # locations — the model_lsf a caller reads back was actually always
+    # the velocity-scale model, evaluated in the wrong units for a
+    # pixel-indexed flux array, even when only the pixel-scale fit was of
+    # interest. See conversation history for the full diagnosis.
+    model_extname = 'model_lsf' if scale[:3] == 'pix' else 'model_lsf_vel'
+
+    if not ray.is_initialized():
+        # SLURM-aware Ray init. On a shared HPC node, ray.init() with no
+        # arguments has three problems:
+        #   1. It autodetects the *physical* node's core/memory count, not
+        #      this job's SLURM cgroup allocation — on a shared node that
+        #      means it can spawn far more workers than you were actually
+        #      given, oversubscribing cores other jobs are using too.
+        #   2. Its default object-store sizing (a fraction of node memory)
+        #      can exceed --mem and get the job OOM-killed.
+        #   3. address='auto' (or unset) risks discovering/joining a stray
+        #      Ray process already bound to default ports on a shared
+        #      node, from another job.
+        # Falls back to sane non-SLURM defaults so this still works
+        # unchanged on a laptop/dev machine outside a Slurm allocation.
+        num_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK',
+                                      os.environ.get('RAY_NUM_CPUS', 0)) or 0)
+        ray_tmpdir = os.environ.get('RAY_TMPDIR')
+        job_id = os.environ.get('SLURM_JOB_ID')
+        if ray_tmpdir is None and job_id is not None:
+            # Default to job-local scratch rather than a shared Lustre
+            # home directory, if we can tell we're in a Slurm job.
+            ray_tmpdir = os.path.join('/tmp', f'ray_{job_id}')
+
+        ray_init_kwargs = dict(address='local', include_dashboard=False)
+        if num_cpus > 0:
+            ray_init_kwargs['num_cpus'] = num_cpus
+        if ray_tmpdir is not None:
+            os.makedirs(ray_tmpdir, exist_ok=True)
+            ray_init_kwargs['_temp_dir'] = ray_tmpdir
+
+        logger.info(f"ray.init({ray_init_kwargs}) "
+                   f"[SLURM_JOB_ID={job_id}, "
+                   f"SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK')}]")
+        ray.init(**ray_init_kwargs)
+
+    linelist_ref = ray.put(linelist)
+    x2d_ref = ray.put(x2d)
+    flx2d_ref = ray.put(flx2d)
+    err2d_ref = ray.put(err2d)
+
+    futures = []
+    for od, indices in zip(orders, cut_):
+        if len(indices) == 0:
+            continue
+        LSF1d_obj = LSF2d_nm[od]
+        futures.append(
+            solve_order_jax.remote(
+                od, indices, linelist_ref, x2d_ref, flx2d_ref, err2d_ref,
+                LSF1d_obj, scale=scale, N=N, maxiter=maxiter, npars=npars,
+            )
+        )
+
+    work_len = len(futures)
+    time_start = time.time()
+    unready = futures
+    n_done = 0
+    n_dropped_total = 0
+
+    while unready:
+        ready, unready = ray.wait(unready, num_returns=1, timeout=5.0)
+        for fut in ready:
+            indices, rows, models = ray.get(fut)
+            linelist[indices] = rows
+            # Checkpoint: write this order's results immediately.
+            with FITS(out_filepath, 'rw', clobber=False) as hdu:
+                for row, model in zip(rows, models):
+                    hdu[model_extname, version].write(
+                        np.atleast_2d(np.asarray(model)),
+                        start=[int(row['order']), int(row['pixl'])]
+                    )
+                hdu['linelist', version].write(rows, firstrow=int(indices[0]))
+            n_done += 1
             time_elapsed = time.time() - time_start
-            progress_bar.update(progress,name='lsf.aux.solve',
-                               time=time_elapsed,
-                               logger=None)
-            
-            time.sleep(1)
-    
-        # clean up
-        for worker in workers:
-            worker.terminate()
-    
-        # print the outputs
-        results = []
-        while not outq.empty():
-            results.append(outq.get())
-        return results
-    
-    if logger is not None:
-        logger = logger.getChild('solve')
-    else:
-        logger = logging.getLogger(__name__).getChild('solve')
-    # abbreviations
-    # scl = f'{scale[:3]}'
+            progress_bar.update(
+                n_done / max(work_len, 1),
+                name=f'lsf.aux.solve [{scale}]',
+                time=time_elapsed,
+                logger=None,
+            )
+
+    logger.info(f"[{scale}] {n_done}/{work_len} order-tasks completed.")
+    return linelist
+
+
+def lsf_exists_for_version(lsf_filepath, version, orders, scales=('pixel', 'velocity')):
+    """
+    Checks whether a previously-completed from_spectrum_2d run produced
+    USABLE LSF models for the given orders/version — not just that the
+    extension exists. An extension that exists but was never actually
+    filled (every row still at its get_empty_lsf default: y all-NaN,
+    order/ledge/redge all 0) looks identical to a real one from a plain
+    extension listing — that exact confusion cost real debugging time
+    earlier in this project, so this checks row contents, not just
+    presence.
+
+    Returns
+    -------
+    dict keyed by scale, each value a dict with:
+        ok             : bool  — True iff every requested order has at
+                         least one segment with finite y-data
+        n_valid        : int   — segments with finite y, among requested orders
+        n_total        : int   — segments found for requested orders (any state)
+        orders_missing : list  — requested orders with zero valid segments
+        reason         : str   — set when ok=False and it's not just a
+                         per-order gap (e.g. extension not found at all)
+    """
+    report = {}
+    orders_set = sorted(set(int(o) for o in np.atleast_1d(orders)))
+
+    if not os.path.exists(lsf_filepath):
+        return {scale: dict(ok=False, n_valid=0, n_total=0,
+                            orders_missing=list(orders_set),
+                            reason=f"file does not exist: {lsf_filepath}")
+               for scale in scales}
+
+    with FITS(lsf_filepath, 'r') as hdu:
+        for scale in scales:
+            extname = f'{scale}_model'
+            try:
+                has_data = hdu[extname, version].has_data()
+            except Exception:
+                has_data = False
+            if not has_data:
+                report[scale] = dict(
+                    ok=False, n_valid=0, n_total=0,
+                    orders_missing=list(orders_set),
+                    reason=f"extension '{extname}' version {version} not found",
+                )
+                continue
+
+            data = hdu[extname, version].read()
+            in_orders = np.isin(data['order'], orders_set)
+            sub = data[in_orders]
+            if len(sub) == 0:
+                report[scale] = dict(
+                    ok=False, n_valid=0, n_total=0,
+                    orders_missing=list(orders_set),
+                    reason=(f"extension '{extname}' version {version} exists but "
+                           f"has no rows for orders {orders_set}"),
+                )
+                continue
+
+            valid_mask = np.array([np.any(np.isfinite(row)) for row in sub['y']])
+            valid_orders = set(int(o) for o in sub['order'][valid_mask])
+            missing = sorted(set(orders_set) - valid_orders)
+            report[scale] = dict(
+                ok=(len(missing) == 0),
+                n_valid=int(valid_mask.sum()),
+                n_total=int(len(sub)),
+                orders_missing=missing,
+                reason="" if not missing else
+                      f"no segment with finite y-data for order(s) {missing}",
+            )
+    return report
+
+
+def solve(out_filepath, lsf_filepath, iteration, order, force_version=None,
+         model_scatter=False, interpolate=False, scale=('pixel', 'velocity'),
+         npars=3, sOrder=None, N=2, maxiter=200,
+         subbkg=hs.subbkg, divenv=hs.divenv, logger=None):
+    """
+    Fits every line's LSF model, order by order, using a single Ray-based,
+    JAX-native batched fit per order (see fit_jax.fit_lines_batch) instead
+    of the old per-line multiprocessing dispatch.
+
+    Structural changes from the previous implementation:
+      - one Ray task per ORDER (not per line, not one giant multiprocessing
+        pool per scale) — reuses the order's LSF interpolation setup across
+        every line in it instead of repeating it per line;
+      - the pixel-scale and velocity-scale passes remain two separate
+        dispatch rounds, because the velocity pass genuinely depends on the
+        completed pixel-scale linelist (ws.comb_dispersion needs it) — this
+        is a real data dependency, not something batching can remove;
+      - results are written to the output FITS file as each order's task
+        completes (checkpointed), not accumulated in memory and written
+        once at the end;
+      - the per-line fit itself is fully JAX-native (fit_jax.py): LSF
+        interpolation is one weighted matmul per order, the spline
+        evaluation and the bounded optimisation are vmapped across every
+        line in the order in one call.
+
+    npars is fixed at 3 (amp, cen, wid) in this implementation — the only
+    combination the previous solve_line() ever actually used. The general
+    n-parameter scipy/lmfit path in harps.lsf.fit.line() is left untouched
+    for diagnostic/manual use.
+    """
+    from harps.lsf.container import LSF2d
+
+    logger = logger.getChild('solve') if logger is not None else \
+        logging.getLogger(__name__).getChild('solve')
+
     if force_version is not None:
         version = force_version
     else:
-        version = hv.item_to_version(dict(iteration=iteration,
-                                        model_scatter=model_scatter,
-                                        interpolate=interpolate
-                                        ),
-                                   ftype='lsf'
-                                   )
+        version = hv.item_to_version(
+            dict(iteration=iteration, model_scatter=model_scatter, interpolate=interpolate),
+            ftype='lsf',
+        )
     scale = np.atleast_1d(scale)
     logger.info(f'version : {version}')
-    # READ LSF
-    with FITS(lsf_filepath,'r',clobber=False) as hdu:
-        if 'pixel' in scale:
-            lsf2d_pix = hdu['pixel_model',version].read()
-            LSF2d_nm_pix = LSF2d(lsf2d_pix)
-        if 'velocity' in scale:
-            lsf2d_vel = hdu['velocity_model',version].read()
-            LSF2d_nm_vel = LSF2d(lsf2d_vel)
-    # lsf2d_gp = LSF2d_gp[order].values
-    # lsf2d_numerical = hlsfit.numerical_model(lsf2d_gp,xrange=(-8,8),subpix=11)
-    # LSF2d_numerical = LSF(lsf2d_numerical)
-    
-    
-    # COPY LINELIST 
+
+    with FITS(lsf_filepath, 'r', clobber=False) as hdu:
+        LSF2d_nm_pix = LSF2d(hdu['pixel_model', version].read()) if 'pixel' in scale else None
+        LSF2d_nm_vel = LSF2d(hdu['velocity_model', version].read()) if 'velocity' in scale else None
+
     io.copy_linelist_inplace(out_filepath, version)
-    
-    # READ OLD LINELIST AND DATA
-    x2d,flx2d,err2d,env2d,bkg2d,linelist = read_outfile4solve(out_filepath,
-                                                        version,
-                                                        scale='pixel')
-    flx_norm, err_norm, bkg_norm  = laux.prepare_data(flx2d,env2d,bkg2d, 
-                                         subbkg=subbkg, divenv=divenv)
-    
-    
-    # MAKE MODEL EXTENSION
-    io.make_extension(out_filepath, 'model_lsf', version, flx2d.shape)
-    
-    nbo,npix = np.shape(flx2d)
+    x2d, flx2d, err2d, env2d, bkg2d, linelist = read_outfile4solve(
+        out_filepath, version, scale='pixel'
+    )
+    flx_norm, err_norm, bkg_norm = laux.prepare_data(
+        flx2d, env2d, bkg2d, subbkg=subbkg, divenv=divenv
+    )
+
+    if 'pixel' in scale:
+        io.make_extension(out_filepath, 'model_lsf', version, flx2d.shape)
+    if 'velocity' in scale:
+        io.make_extension(out_filepath, 'model_lsf_vel', version, flx2d.shape)
+
+    nbo, npix = np.shape(flx2d)
     orders = specfunc.prepare_orders(order, nbo, sOrder=sOrder, eOrder=None)
-    
-    # firstrow = int(1e6)
-    cut_ = [np.ravel(np.where(linelist['order']==od)[0]) for od in orders]
-    cut = np.hstack(cut_)
-    tot = len(cut)
+    cut_ = [np.ravel(np.where(linelist['order'] == od)[0]) for od in orders]
+    tot = sum(len(c) for c in cut_)
     logger.info(f"Number of lines to fit : {tot}")
-    # new_linelist = []
-    # model2d = np.zeros_like(flx2d)
-    # def get_iterable()
-    # lines = (line for line in linelist)
+
     time_start = time.time()
-    
-    
-    option = 2
-    if option<3:
-        if 'pixel' in scale:
-            partial_function_pix = partial(solve_line,
-                                           linelist=linelist,
-                                           x2d=x2d,
-                                           flx2d=flx_norm,
-                                           err2d=err_norm,
-                                           LSF2d_nm=LSF2d_nm_pix,
-                                           ftype='lsf',
-                                           scale='pixel',
-                                           interpolate=interpolate,
-                                           npars=npars)
-            if option==1:
-                with multiprocessing.Pool() as pool:
-                    results = pool.map(partial_function_pix, cut)
-            elif option==2:
-                results = bulk_fit(partial_function_pix)
-            print(np.shape(np.asarray(results,dtype="object")))
-            new_llist, models = np.transpose(np.asarray(results,dtype="object"))
-        
-            linelist[cut] = new_llist
-        # delete these lines later. These were put in to skip re-doing the entire
-        # calculations for pixel when also creating velocity models
-        # with FITS(out_filepath,'r') as hdul:
-            # linelist = hdul['linelist',version].read()
-        # fit for wavelength positions
-        if 'velocity' in scale:
-            lsf_wavesol = ws.comb_dispersion(linelist, version=701, fittype='lsf', 
-                                             npix=npix, 
-                                             nord=nbo,
-                                             ) 
-            
-            partial_function_vel= partial(solve_line,
-                                           linelist=linelist,
-                                           x2d=lsf_wavesol,
-                                           flx2d=flx_norm,
-                                           err2d=err_norm,
-                                           LSF2d_nm=LSF2d_nm_vel,
-                                           ftype='lsf',
-                                           scale='velocity',
-                                           interpolate=interpolate,
-                                           npars=npars)
-            
-            if option==1:
-                with multiprocessing.Pool() as pool:
-                    results = pool.map(partial_function_pix, cut)
-            elif option==2:
-                results = bulk_fit(partial_function_vel)
-            new_llist, models = np.transpose(np.asarray(results,dtype="object"))
-            linelist[cut] = new_llist
-    else:
-        logger.info('Starting distributed line solving via Ray')
-        if not ray.is_initialized():
-            ray.init()
-        
-        # 1. Place shared data into the Object Store [2, 3]
-        x2d_ref = ray.put(x2d)
-        flx2d_ref = ray.put(flx_norm)
-        err2d_ref = ray.put(err_norm)
-        ll_ref  = ray.put(linelist)
-        # Handle the LSF containers separately for pixel and velocity
-        LSF2d_nm_pix_ref = ray.put(LSF2d_nm_pix)
-        LSF2d_nm_vel_ref = ray.put(LSF2d_nm_vel) if 'velocity' in scale else None
-    
-        # 2. Launch Batched Ray tasks [4, 5]
-        # We use 'cut_' which is already grouped by echelle order [1]
-        if 'pixel' in scale:
-            futures_pix = [
-                solve_1d.remote(order_idx_list, 
-                                ll_ref, 
-                                x2d_ref, 
-                                flx2d_ref, 
-                                err2d_ref, 
-                                LSF2d_nm_pix_ref,
-                                ftype='lsf', scale='pixel', 
-                                interpolate=interpolate, npars=npars)
-                for order_idx_list in cut_
-            ]
-            
-            # Monitor progress using ray.wait [6]
-            work_len = len(futures_pix)
-            time_start = time.time()
-            finished_count = 0
-            unready = futures
-            results_ordered = [None] * work_len
-            # Map the futures to their original iterator indices to preserve order
-            future_to_index = {f: i for i, f in enumerate(futures_pix)}
 
-            while unready:
-                # Wait for at least one task to finish (timeout=1s to refresh time display)
-                ready, unready = ray.wait(unready, num_returns=1, timeout=1.0)
-                
-                # Update stats
-                finished_count = work_len - len(unready)
-                progress = finished_count / work_len
-                time_elapsed = time.time() - time_start
-                
-                progress_bar.update(
-                    progress, 
-                    name=f'Fitting lines in pixel space',
-                    time=time_elapsed,
-                    logger=None
-                )
-            
-            # Retrieve and flatten results [6]
-            batched_results = ray.get(futures_pix)
-            results = [line for order_res in batched_results for line in order_res]
-            new_llist, models = np.transpose(np.asarray(results, dtype="object"))
-            linelist[cut] = new_llist
-    
-        if 'velocity' in scale:
-            lsf_wavesol = ws.comb_dispersion(linelist, version=700, fittype='lsf', 
-                                             npix=npix, 
-                                             nord=nbo,
-                                             ) 
-            wav2d_ref = ray.put(lsf_wavesol)
-            futures_wav = [
-                solve_1d.remote(order_idx_list, 
-                                ll_ref, 
-                                wav2d_ref,
-                                flx2d_ref, 
-                                err2d_ref, 
-                                LSF2d_nm_vel_ref,
-                                ftype='lsf', scale='velocity', 
-                                interpolate=interpolate, npars=npars)
-                for order_idx_list in cut_
-            ]
-            
-            # Monitor progress using ray.wait [6]
-            work_len = len(futures_wav)
-            time_start = time.time()
-            finished_count = 0
-            unready = futures
-            results_ordered = [None] * work_len
-            # Map the futures to their original iterator indices to preserve order
-            future_to_index = {f: i for i, f in enumerate(futures_wav)}
+    if 'pixel' in scale:
+        linelist = _dispatch_orders_checkpointed(
+            orders, cut_, linelist, x2d, flx_norm, err_norm, LSF2d_nm_pix,
+            out_filepath, version, 'pixel', N, maxiter, npars, logger,
+        )
 
-            while unready:
-                # Wait for at least one task to finish (timeout=1s to refresh time display)
-                ready, unready = ray.wait(unready, num_returns=1, timeout=1.0)
-                
-                # Update stats
-                finished_count = work_len - len(unready)
-                progress = finished_count / work_len
-                time_elapsed = time.time() - time_start
-                
-                progress_bar.update(
-                    progress, 
-                    name=f'Fitting lines in pixel space',
-                    time=time_elapsed,
-                    logger=None
-                )
-            
-            # Retrieve and flatten results [6]
-            batched_results = ray.get(futures_wav)
-            results = [line for order_res in batched_results for line in order_res]
-            new_llist, models = np.transpose(np.asarray(results, dtype="object"))
-            linelist[cut] = new_llist
-    worktime = (time.time() - time_start)
-    h, m, s  = progress_bar.get_time(worktime)
+    if 'velocity' in scale:
+        lsf_wavesol = ws.comb_dispersion(
+            linelist, version=701, fittype='lsf', npix=npix, nord=nbo,
+        )
+        linelist = _dispatch_orders_checkpointed(
+            orders, cut_, linelist, lsf_wavesol, flx_norm, err_norm, LSF2d_nm_vel,
+            out_filepath, version, 'velocity', N, maxiter, npars, logger,
+        )
+
+    worktime = time.time() - time_start
+    h, m, s = progress_bar.get_time(worktime)
     logger.info(f"Total time elapsed : {h:02d}h {m:02d}m {s:02d}s")
-    
-    if save2fits:
-        for i,(ll,mod) in enumerate(zip(new_llist,models)):
-            od   = ll['order']
-            pixl = ll['pixl']
-            row  = cut[i]
-            with FITS(out_filepath,'rw',clobber=False) as hdu:
-                hdu['model_lsf',version].write(np.array(mod),start=[od,pixl])
-                hdu['linelist',version].write(np.atleast_1d(ll),firstrow=row)
-        # if 'velocity' in scale:
-        #     for i,(mod) in enumerate(zip(new_llist,models)):
-        #         od   = ll['order']
-        #         pixl = ll['pixl']
-        #         row  = cut[i]
-        #         with FITS(out_filepath,'rw',clobber=False) as hdu:
-        #             hdu['model_lsf',version].write(np.array(mod),start=[od,pixl])
-        #             # hdu['linelist',version].write(np.atleast_1d(ll),firstrow=row)
-           
-        with FITS(out_filepath,'rw',clobber=False) as hdu:
-            hdu['linelist',version].write_key('ITER', iteration)
-            hdu['linelist',version].write_key('SCT', model_scatter)
-            hdu['linelist',version].write_key('INTP', interpolate)
+
+    with FITS(out_filepath, 'rw', clobber=False) as hdu:
+        hdu['linelist', version].write_key('ITER', iteration)
+        hdu['linelist', version].write_key('SCT', model_scatter)
+        hdu['linelist', version].write_key('INTP', interpolate)
+
     return linelist
 
-class LineSolver(multiprocessing.Process):
-    """
-    Simple worker.
-    """
 
-    def __init__(self, name, function, in_queue, out_queue):
-        super(LineSolver, self).__init__()
-        self.name = name
-        self.function = function
-        self.in_queue = in_queue
-        self.out_queue = out_queue
-        self.logger = logging.getLogger("worker_"+name)
-
-    def run(self):
-        while True:
-            # grab work; do something to it (+1); then put the result on the output queue
-            item = self.in_queue.get()
-            # print(f'item after queue.get = {item}')
-            result = self.function(item,logger=self.logger)
-            self.out_queue.put(result)
-            
 def solve_line(i,linelist,x2d,flx2d,err2d,LSF2d_nm,ftype='gauss',scale='pix',
                 interpolate=False,npars=None,logger=None):
     
@@ -1234,19 +1311,20 @@ def solve_line(i,linelist,x2d,flx2d,err2d,LSF2d_nm,ftype='gauss',scale='pix',
     
     try: 
         LSF1d  = LSF2d_nm[od]
-    except:
-        logger.warning("LSF not found")
-        return None
+    except Exception:
+        logger.warning(f"LSF not found for order {od} (line {i})")
+        line[f'lsf_{scl}'] = np.nan
+        return line, np.zeros_like(flx1l)
     
     success = False
     pars = "None"
     chisq = np.nan
-    print(f'{len(LSF1d.values)=}\t{len(LSF2d_nm.values)=}')
     if LSF1d is None or len(LSF1d) <= 1:
         logger.warning(f"Order {od}: No valid LSF models found. Skipping line {i}.")
         # Return a failed line result to stay consistent with the bulk_fit loop
         line[f'lsf_{scl}'] = np.nan
         return line, np.zeros_like(flx1l)
+    logger.debug(f'{len(LSF1d.values)=}\t{len(LSF2d_nm.values)=}')
     try:
         logger.info(f"Line {i}, barycentre {bary}, LSF for this order exists")
         logger.info("interpolate LSF", LSF1d.interpolate_lsf(bary))
@@ -1527,102 +1605,6 @@ def clean_input(
             print("Initial array was empty, 0 points kept.")
 
     return tuple(result_arrays)
-
-def clean_input_old(x1s,flx1s,err1s=None,filter=None,xrange=None,binsize=None,
-                sort=True,verbose=False,plot=False,rng_key=None):
-    '''
-    Removes infinities, NaN and zeros from the arrays. If sort=True, sorts the
-    data by pixel number. If filter is given, removes every nth element from
-    the array, where n=filter value.
-    
-
-    Parameters
-    ----------
-    x1s : array-like
-        X-axis array, either pixels or velocities.
-    flx1s : array-like
-        Flux array.
-    err1s : array-like, optional
-        Error array. The default is None.
-    verbose : boolean, optional
-        Prints messages. The default is False.
-    sort : boolean, optional
-        Sorts the array. The default is True.
-    filter_every : int, optional
-        Filters every int element from the arrays. The default is None.
-
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
-
-    '''
-    x1s    = np.ravel(x1s)
-    sorter = np.argsort(x1s)
-    x1s    = x1s[sorter]
-    flx1s  = np.ravel(flx1s)[sorter]
-    if err1s is not None:
-        err1s = np.ravel(err1s)[sorter]
-    # remove infinites, nans, zeros and outliers
-    arr = np.array([np.isfinite(x1s),
-                    np.abs(x1s)<10,
-                    np.isfinite(flx1s),
-                    np.isfinite(err1s),
-                    flx1s!=0,
-                    # np.abs(x1s)<8.,
-                    ])
-    finite  = np.logical_and.reduce(arr)
-    cut     = np.where(finite_)[0]
-    # optimal binning and outlier detection    
-    # counts, bin_edges = bin_optimally(x1s[finite_],minpts=5)
-    bin_edges = np.arange(-8,8+0.5,0.5)
-    # counts, edges = np.histogram(x1s[finite_],bins=bin_edges)
-    # print(counts,bin_edges)
-    # idx     = np.digitize(x1s[finite_],bin_edges)
-    # identify outliers and remove them
-    # keep   = ~hf.is_outlier_from_linear(x1s[finite_],
-    #                                     flx1s[finite_],
-    #                                     idx,
-    #                                     yerrs=err1s[finite_],
-    #                                     thresh=3.5)
-    # keep  = ~hf.is_outlier_bins(flx1s[finite_],idx,thresh=3.5)
-    # finite  = cut[keep]
-    # uncomment next line if no outliers should be removed
-    # finite  = finite_
-    if plot:
-        # import matplotlib.pyplot as plt
-        plt.figure()
-        plt.scatter(x1s,flx1s,marker='o')
-        plt.scatter(x1s[~finite_],flx1s[~finite_],marker='x',c='g')
-        # plt.scatter(x1s[cut[~keep]],flx1s[cut[~keep]],marker='x',c='r')
-        [plt.axvline(edge,ls=':') for edge in bin_edges]
-    numpts  = np.size(flx1s)
-    
-     
-    x      = x1s[finite]
-    flx    = flx1s[finite]
-    res    = (x,flx)
-    if err1s is not None:
-        err = np.ravel(err1s)[finite]
-        res = res + (err,)
-    
-    if filter:
-        rng_key = rng_key if rng_key is not None else jax.random.PRNGKey(55873)
-        shape   = (len(x)//filter,)
-        choice  = jax.random.choice(rng_key,np.arange(len(x)),shape,False)
-        res = tuple(array[choice] for array in res)
-        # res = (array[::filter] for array in res)
-    if sort:
-        sorter = np.argsort(res[0])
-        res = (array[sorter] for array in res)
-    res = tuple(res)    
-    if verbose:
-        diff  = numpts-len(res[0])
-        print("{0:5d}/{1:5d} ({2:5.2%}) kept ; ".format(len(res[0]),numpts,
-                                                      len(res[0])/numpts) +\
-              "{0:5d}/{1:5d} ({2:5.2%}) discarded".format(diff,numpts,
-                                                        diff/numpts))
-    return tuple(res)   
 
 def lin2log(values,errors):
     '''

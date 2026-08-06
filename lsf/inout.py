@@ -41,25 +41,45 @@ def write_lsf_to_fits(data,filepath,extname,version=None,clobber=False):
     # filepath = os.path.join(dirpath,filename)
     with FITS(filepath,mode='rw',clobber=clobber) as hdu:
         status = 'failed'
-        # extver_hasdata = False
-        # try:
-        #     hdu[extname,version].has_data()
-        #     extvar_hasdata = True
-        # except:
-        #     pass
-        
-        # if extvar_hasdata & overwrite:
-        #     expression = helper_get_expression(data)
-        #     rows2del = hdu[extname,version].where()
-        
-        
         try:
-            hdu[extname,version].append(data)
-            action = 'append'
+            existing_len = len(hdu[extname,version].read())
+            exists = True
+        except Exception:
+            exists = False
+            existing_len = None
+
+        try:
+            if exists:
+                # IMPORTANT: this extension/version already has data — from
+                # this run's earlier write, or from an entirely separate
+                # PRIOR run of the pipeline. .append() used to be tried
+                # here, which succeeds silently whenever the extension
+                # already exists and just grows the table, tacking the new
+                # rows on AFTER whatever was already there instead of
+                # replacing it. Every rerun with clobber=False therefore
+                # accumulates another copy, with the OLDEST data (often
+                # stale defaults from a partial/failed earlier run) sitting
+                # at the front.
+                if existing_len != len(data):
+                    print(f"WARNING: '{extname}' version {version} already "
+                         f"has {existing_len} rows, but the new data has "
+                         f"{len(data)}. Overwriting the first {len(data)} "
+                         f"rows in place — if {len(data)} < {existing_len}, "
+                         f"{existing_len - len(data)} stale trailing row(s) "
+                         f"from a previous run will remain. If that's not "
+                         f"what you want, delete the file or pass "
+                         f"clobber=True for a clean rewrite.")
+                hdu[extname,version].write(data, firstrow=0)
+                action = 'overwrite'
+            else:
+                hdu.write(data,extname=extname,extver=version)
+                action = 'write'
             status = 'done'
-        except:
+        except Exception:
+            # Fall back to creating a fresh extension only if we genuinely
+            # couldn't write to an existing one for some other reason.
             hdu.write(data,extname=extname,extver=version)
-            action = 'write'
+            action = 'write (fallback)'
             status = 'done'
         finally:
             hdu.close()

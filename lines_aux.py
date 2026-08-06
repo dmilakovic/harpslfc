@@ -25,7 +25,7 @@ def prepare_data(flx,env,bkg,subbkg,divenv):
         var_bkg = np.zeros_like(f)  
         e  = env
     if divenv:
-        data_norm = (f-b) / (e-b)
+        data_norm = (f-b) / e
     else:
         data_norm = f - b
 
@@ -36,8 +36,8 @@ def prepare_data(flx,env,bkg,subbkg,divenv):
         var = np.abs(flx) + np.abs(bkg)
         bkg_norm  = np.zeros_like(bkg)
     elif subbkg and divenv:
-        var = 1./(e-b)**2 * var_data + ((f-e)/(e-b)**2)**2 * var_bkg + \
-            ((b-f)/(e-b)**2)**2 * var_env
+        var = 1./e**2 * var_data + ((f-e)/e**2)**2 * var_bkg + \
+            ((b-f)/e**2)**2 * var_env
         bkg_norm  = np.zeros_like(bkg)
     elif not subbkg and divenv:
         var = var_data/e**2 + f**2/e**4 * var_env

@@ -38,433 +38,23 @@ from logging.handlers import QueueHandler, QueueListener
 import ray
 
 from . import aux, gp, gp_aux
-from .batch   import make_batch, split_batch, unbatch_results, SegmentBatch
-from .cluster import init_ray, get_num_gpus, get_jax_platform
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Decorator
-# ───────────────────────────────────────────────────────────────────────────── 
-def make_fitter_actor(use_gpu: bool = True):
-    """Dynamically create a Ray actor with or without GPU resource request."""
-    if use_gpu:
-        return ray.remote(num_gpus=1, num_cpus=2)(GPUFitter)
-    else:
-        return ray.remote(num_cpus=2)(GPUFitter)
+# NOTE (cleanup): this file used to contain a second, GPU-batched
+# Ray/vmap fitting pipeline here (make_fitter_actor, GPUFitter,
+# recenter_segment, _build_lsf1s, and a first definition of
+# from_spectrum_2d), plus unused helpers _log_progress and model_1si.
+# It was never reachable: Python kept only the *second* from_spectrum_2d
+# definition further down in this module, silently shadowing this one.
+# It also called several functions/kwargs that don't exist
+# (gp_aux.generate_starts_batch, gp.predict_lsf, GPUFitter.__init__
+# with loss_name/num_starts, aux.prepare_2d_arrays, etc.) and would have
+# raised immediately if it had ever been invoked. Removed as dead code.
+# The active pipeline is the from_spectrum_2d defined below, which
+# dispatches per-order Ray tasks via model_1d.
 # ─────────────────────────────────────────────────────────────────────────────
-# Ray remote worker
-# ─────────────────────────────────────────────────────────────────────────────
-class GPUFitter:
-    """
-    Stateful Ray actor owning one GPU.
-    Processes all segments of one exposure through both phases.
-
-    Phase 1 and Phase 2 have separate compiled fitters because they have
-    different static use_scatter flags — JAX compiles a different graph
-    for each. Both are compiled on first call and cached for the lifetime
-    of the actor.
-    """
-
-    def __init__(self,
-                 model_scatter: bool = True,
-                 numiter      : int  = 5,
-                 maxiter      : int  = 300,
-                 ):
-        import os
-        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-        import jax
-        self.device       = jax.devices()[0]
-        self.model_scatter = model_scatter
-
-        # Two separately compiled fitters — one per phase
-        self.phase1_fitter = lsfgp.make_phase_fitter(
-            use_scatter = False,
-            numiter     = numiter,
-            maxiter     = maxiter,
-        )
-        self.phase2_fitter = lsfgp.make_phase_fitter(
-            use_scatter = True,
-            numiter     = numiter,
-            maxiter     = maxiter,
-        ) if model_scatter else None
-
-    def fit(self, batch) -> list[dict]:
-        """
-        Full two-phase fit for all segments in the batch.
-
-        Phase 1: jit+vmap on GPU — all segments in one dispatch
-        Scatter: CPU loop — sequential but lightweight
-        Phase 2: jit+vmap on GPU — all segments in one dispatch (if model_scatter)
-        """
-        import jax
-        import numpy as np
-
-        N = len(batch.meta)
-        if N == 0:
-            return []
-
-        # ── Generate starts and bounds ────────────────────────────────────────
-        starts = gp_aux.generate_starts_batch(
-            batch.x, batch.flx, batch.err, num_starts=4
-        )
-        bounds = gp_aux.generate_bounds_batch(
-            batch.x, batch.flx, batch.err
-        )
-
-        # ── Phase 1: no scatter ───────────────────────────────────────────────
-        # scatter_y_err = y_err (no rescaling in Phase 1)
-        phase1_state = self.phase1_fitter(
-            batch.x, batch.flx, batch.err, batch.mask,
-            starts, bounds,
-            batch.err,           # scatter_y_err = original err in Phase 1
-        )
-        jax.block_until_ready(phase1_state.params)
-
-        if not self.model_scatter:
-            # No Phase 2 — package Phase 1 results directly
-            return self._package_results(phase1_state, batch.meta)
-
-        # ── Scatter training (CPU, between phases) ────────────────────────────
-        # This runs on CPU and is sequential across segments.
-        # It is fast relative to the GPU phases because it involves only
-        # 1D GP fitting on binned residuals (~40 points per segment).
-        scatter_list, scatter_y_err = lsfgp.train_scatter_batch(
-            batch.x, batch.flx, batch.err,
-            phase1_state.mask,
-            phase1_state.params,
-        )
-
-        # ── Phase 2: with scatter ─────────────────────────────────────────────
-        # scatter_y_err is now the pre-rescaled error array (N_seg, max_len)
-        # passed into the loop as a fixed array — rescale_errors is NOT
-        # called inside the jit'd loop, keeping it pure and vmappable
-        phase2_state = self.phase2_fitter(
-            batch.x, batch.flx, batch.err, phase1_state.mask,
-            starts, bounds,
-            scatter_y_err,       # pre-rescaled errors — fixed for this phase
-        )
-        jax.block_until_ready(phase2_state.params)
-
-        return self._package_results(phase2_state, batch.meta,
-                                     scatter_list=scatter_list,
-                                     phase1_params=phase1_state.params)
-
-    def _package_results(self,
-                         state        : 'SegmentState',
-                         meta         : list,
-                         scatter_list : list = None,
-                         phase1_params: dict = None,
-                         ) -> list[dict]:
-        """Convert batched JAX state back to per-segment dicts."""
-        import jax
-        results = []
-        for i, (od, pixl, pixr) in enumerate(meta):
-            seg_params = jax.tree_util.tree_map(lambda a: a[i], state.params)
-            result = {
-                'params'        : seg_params,
-                'shift'         : float(state.shift[i]),
-                'loss'          : float(state.delta[i]),
-                'order'         : od,
-                'pixl'          : pixl,
-                'pixr'          : pixr,
-                'scatter'       : scatter_list[i] if scatter_list else None,
-                'params_nosct'  : (jax.tree_util.tree_map(lambda a: a[i], phase1_params)
-                                   if phase1_params is not None else None),
-            }
-            results.append(result)
-        return results
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Recentering (CPU, lightweight, runs after GPU fitting)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def recenter_segment(x1s      : np.ndarray,
-                     flx1s    : np.ndarray,
-                     err1s    : np.ndarray,
-                     params0  : dict,
-                     metadata : dict,
-                     numiter  : int = 5,
-                     **kwargs
-                     ) -> dict | None:
-    """
-    Iterative recentering of one segment using the GPU-fitted params as
-    a warm start. Runs on CPU — fast because we skip the expensive
-    multi-start global optimisation.
-
-    Changes vs original model_1s:
-      - Accepts params0 (warm start) instead of running cold multi-start
-      - Removed Ray dependency
-      - Returns same dict structure as original model_1s for compatibility
-    """
-    import jax.numpy as jnp
-
-    x    = jnp.array(x1s)
-    flx  = jnp.array(flx1s)
-    err  = jnp.array(err1s)
-    mask = jnp.ones_like(x)   # all real for single segment (no padding)
-
-    params = params0
-    centre = metadata.get('centre', 0.0)
-
-    for iteration in range(numiter):
-        # Predict GP mean at fine grid around current centre
-        x_pred        = jnp.linspace(centre - 3, centre + 3, 200)
-        mean, _       = gp.predict_lsf(params, x, flx, err, mask, x_pred)
-
-        # Refine centre estimate (e.g. centroid of predicted LSF)
-        new_centre    = float(jnp.sum(x_pred * mean) / jnp.sum(mean))
-        x_recentered  = x - new_centre
-
-        # One more optimisation step from warm start
-        solver = __import__('jaxopt').LBFGSB(fun=gp.loss_LSF, maxiter=100)
-        result = solver.run(params,
-                            x=x_recentered, y=flx, yerr=err, mask=mask)
-        params = result.params
-        centre = new_centre
-
-        if abs(new_centre - centre) < 1e-4:
-            break
-
-    return {
-        'params' : params,
-        'centre' : centre,
-        'order'  : metadata['order'],
-        'pixl'   : metadata['pixl'],
-        'pixr'   : metadata['pixr'],
-        'lsf1s'  : _build_lsf1s(params, x - centre, flx, err),
-    }
-
-
-def _build_lsf1s(params : dict,
-                 x      : np.ndarray,
-                 flx    : np.ndarray,
-                 err    : np.ndarray
-                 ) -> dict:
-    """
-    Build the LSF model output dict from fitted GP parameters.
-    Mirrors the structure your existing code expects in lsf2d.
-    Modify field names to match your gp_aux.parnames_lfc structure.
-    """
-    import jax.numpy as jnp
-    x_fine  = jnp.linspace(x.min(), x.max(), 500)
-    mask    = jnp.ones_like(jnp.array(x))
-    mean, _ = gp.predict_lsf(
-        params,
-        jnp.array(x), jnp.array(flx), jnp.array(err), mask, x_fine
-    )
-    return {
-        'x'      : np.array(x_fine),
-        'y'      : np.array(mean),
-        'params' : params,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
-def from_spectrum_2d(spec,
-                     orders          : list[int],
-                     iteration       : int,
-                     scale           : str  = 'pixel',
-                     numseg          : int  = 16,
-                     iter_center     : int  = 5,
-                     model_scatter   : bool = True,
-                     num_starts      : int  = 4,
-                     maxiter_lbfgs   : int  = 300,
-                     save_fits       : bool = True,
-                     clobber         : bool = False,
-                     plot            : bool = False,
-                     logger          : logging.Logger | None = None,
-                     **kwargs
-                     ) -> object:
-    """
-    Fit LSF for all orders/segments of a single exposure.
-
-    Architecture
-    ------------
-    1. Prepare 2D arrays from spectrum
-    2. Build padded SegmentBatch for all ~2000 segments
-    3. Split batch across available GPUs
-    4. Launch one GPUFitter Ray actor per GPU
-    5. Dispatch sub-batches to actors — GPU fitting runs in parallel
-    6. Collect GPU results
-    7. Recenter each segment on CPU (warm-started from GPU params)
-    8. Assemble lsf2d output
-
-    Parameters
-    ----------
-    spec          : harps Spectrum object
-    orders        : list of echelle order indices
-    iteration     : fitting iteration number (for file naming)
-    scale         : 'pixel' or 'velocity'
-    numseg        : number of segments per order
-    iter_center   : recentering iterations after GPU fit
-    model_scatter : include scatter (jitter) term in GP
-    num_starts    : L-BFGS-B random restarts per segment
-    maxiter_lbfgs : max L-BFGS-B iterations
-    """
-    if logger is None:
-        logger = logging.getLogger(__name__)
-
-    t_total = time.time()
-
-    # ── Step 1: prepare data arrays ──────────────────────────────────────────
-    logger.info("Preparing 2D spectrum arrays...")
-    x2d, flx2d, err2d = aux.prepare_2d_arrays(spec, orders, scale=scale)
-    seglims            = aux.get_segment_limits(orders, x2d, numseg=numseg)
-
-    # ── Step 2: build full segment batch ─────────────────────────────────────
-    logger.info("Building segment batch...")
-    full_batch = make_batch(x2d, flx2d, err2d, seglims, orders)
-    N_seg      = len(full_batch.meta)
-    logger.info(f"Total valid segments: {N_seg}")
-
-    # ── Step 3: initialise Ray and determine GPU count ────────────────────────
-    init_ray()
-    # n_gpus = get_num_gpus()
-    # if n_gpus == 0:
-    #     raise RuntimeError(
-    #         "No GPUs found in Ray cluster. "
-    #         "Check your SLURM --gres=gpu allocation."
-    #     )
-    # logger.info(f"Distributing {N_seg} segments across {n_gpus} GPU(s).")
-    
-    
-
-    # ── Step 4: create one actor per GPU ─────────────────────────────────────
-    loss_name = 'scatter' if model_scatter else 'lsf'
-    platform  = get_jax_platform()
-    use_gpu   = (platform == 'gpu')
-    n_workers = get_num_gpus() if use_gpu else os.cpu_count() // 2
-    
-    FitterActor = make_fitter_actor(use_gpu=use_gpu)
-    actors = [
-        FitterActor.remote(
-            loss_name  = loss_name,
-            num_starts = num_starts,
-            maxiter    = maxiter_lbfgs,
-        )
-        for _ in range(n_workers)
-    ]
-    logger.info(
-        f"Using {n_workers} {'GPU' if use_gpu else 'CPU'} worker(s) "
-        f"(platform: {platform})"
-    )
-    
-
-    # ── Step 5: dispatch sub-batches ──────────────────────────────────────────
-    sub_batches = split_batch(full_batch, n_workers)
-    futures     = [
-        actor.fit.remote(sub_batch)
-        for actor, sub_batch in zip(actors, sub_batches)
-    ]
-
-    # ── Step 6: collect GPU results ───────────────────────────────────────────
-    logger.info("Waiting for GPU fitting to complete...")
-    t_gpu   = time.time()
-    raw_results = ray.get(futures)   # blocks until all GPUs done
-    dt_gpu  = time.time() - t_gpu
-    logger.info(f"GPU fitting complete in {dt_gpu:.1f}s")
-
-    # Flatten results from all actors into one dict keyed by (od, pixl, pixr)
-    flat_results = {}
-    for actor_results, sub_batch in zip(raw_results, sub_batches):
-        for result in actor_results:
-            key = (result['order'], result['pixl'], result['pixr'])
-            flat_results[key] = result
-
-    # ── Step 7: recentering on CPU ────────────────────────────────────────────
-    logger.info(f"Recentering {N_seg} segments on CPU ({iter_center} iterations)...")
-    parnames = gp_aux.parnames_all if model_scatter else gp_aux.parnames_lfc
-    lsf2d    = aux.get_empty_lsf(N_seg, n_data=600,
-                                  n_sct=40, pars=parnames)
-
-    for i, (od, pixl, pixr) in enumerate(full_batch.meta):
-        key    = (od, pixl, pixr)
-        result = flat_results.get(key)
-        if result is None:
-            continue
-
-        x1s   = np.ravel(x2d  [od, pixl:pixr])
-        flx1s = np.ravel(flx2d[od, pixl:pixr])
-        err1s = np.ravel(err2d [od, pixl:pixr])
-
-        metadata = {
-            'order'  : od,
-            'pixl'   : pixl,
-            'pixr'   : pixr,
-            'centre' : float((pixl + pixr) / 2),
-        }
-
-        lsf_output = recenter_segment(
-            x1s, flx1s, err1s,
-            params0  = result['params'],
-            metadata = metadata,
-            numiter  = iter_center,
-            **kwargs
-        )
-
-        if lsf_output is not None:
-            segm       = int((pixl + pixr) / 2 // (pixr - pixl))
-            lsf_output['segm'] = segm
-            lsf2d[i]   = aux.copy_lsf1s_data(lsf_output['lsf1s'], lsf2d[i])
-
-        # Progress
-        frac = (i + 1) / N_seg
-        _log_progress(frac, N_seg, t_total, logger)
-
-    # ── Step 8: save and return ───────────────────────────────────────────────
-    dt_total = time.time() - t_total
-    h, m, s  = int(dt_total // 3600), int((dt_total % 3600) // 60), int(dt_total % 60)
-    logger.info(f"from_spectrum_2d complete in {h:02d}h {m:02d}m {s:02d}s")
-
-    if save_fits:
-        aux.save_lsf2d(lsf2d, spec, iteration, scale=scale, clobber=clobber)
-
-    return lsf2d
-
-
-def _log_progress(frac: float, N: int, t0: float, logger: logging.Logger):
-    dt   = time.time() - t0
-    done = int(frac * 40)
-    bar  = '=' * done + '-' * (40 - done)
-    h, m, s = int(dt // 3600), int((dt % 3600) // 60), int(dt % 60)
-    logger.info(
-        f"Recentering [{bar}] {frac*100:6.1f}%   "
-        f"elapsed: {h:02d}h {m:02d}m {s:02d}s"
-    )
-
-def model_1si(i,seglims,x2d,flx2d,err2d,numiter=5,filter=None,model_scatter=False,
-                    plot=False,save_plot=False,metadata=None,
-                    **kwargs):
-    logger = logging.getLogger(__name__)
-    pixl = seglims[i]
-    pixr = seglims[i+1]
-    x1s  = np.ravel(x2d[pixl:pixr])
-    flx1s = np.ravel(flx2d[pixl:pixr])
-    err1s = np.ravel(err2d[pixl:pixr])
-    checksum = aux.get_checksum(x1s, flx1s, err1s,uniqueid=i)
-    
-    try:
-        metadata.update({'segment':i+1,'checksum':checksum})
-    except:
-        pass
-    out  = model_1s(x1s,flx1s,err1s,numiter=numiter,
-                    filter=filter,model_scatter=model_scatter,
-                    plot=plot,metadata=metadata,
-                    **kwargs)
-    if out is not None:
-        out['ledge'] = pixl
-        out['redge'] = pixr
-        out['segm'] = i
-    else:
-        out = None
-    return i, out
-
-@ray.remote
 def model_1s_remote(od, pixl, pixr, x2d, flx2d, err2d, **kwargs):
     # This is exactly the existing model_1s_ logic
     # It will now run on whatever CPU Ray assigns it to
@@ -492,7 +82,7 @@ def model_1s_(od,pixl,pixr,x2d,flx2d,err2d,numiter=5,filter=None,model_scatter=F
         pass
     metadata.update({'order':od})
     segm = int(divmod((pixl+pixr)/2.,(pixr-pixl))[0])
-    metadata.update({'segment':segm})
+    metadata.update({'segm':segm})
     if logger is not None:
         logger = logger.getChild('model_1s_')
     else:
@@ -528,68 +118,11 @@ def model_1s_(od,pixl,pixr,x2d,flx2d,err2d,numiter=5,filter=None,model_scatter=F
         logger.error(msg)
     return out
 
-def model_1s_4ray(od,pixl,pixr,x1s,flx1s,err1s,
-                  numiter=5,filter=None,model_scatter=False,
-                  plot=False,save_plot=False,metadata=None,logger=None,
-                    **kwargs):
-    # x1s  = np.ravel(x2d[od,pixl:pixr])
-    # flx1s = np.ravel(flx2d[od,pixl:pixr])
-    # err1s = np.ravel(err2d[od,pixl:pixr])
-    
-    # valid = np.any(x1s)
-    valid = np.any((flx1s != 0) & np.isfinite(flx1s))
-    if not valid:
-        parnames = gp_aux.parnames_lfc.copy() + gp_aux.parnames_sct.copy()
-        out = aux._prepare_lsf1s(n_data=1,n_sct=1,pars=parnames)
-        return out
-    
-    checksum = aux.get_checksum(x1s, flx1s, err1s,uniqueid=pixl+pixr+od)
-    # print(f"segment = {i+1}/{len(seglims)-1}")
-    try:
-        metadata.update({'checksum':checksum})
-    except:
-        pass
-    metadata.update({'order':od})
-    segm = int(divmod((pixl+pixr)/2.,(pixr-pixl))[0])
-    metadata.update({'segment':segm})
-    if logger is not None:
-        logger = logger.getChild('model_1s_')
-    else:
-        logger = logging.getLogger(__name__).getChild('model_1s_')
-    logging.info(f"Order, segment : {od}, {segm}")
-    # print(f"Order, segment : {od}, {segm}")
-    # try:
-    out  = model_1s(x1s,flx1s,err1s,
-                    numiter=numiter,
-                    filter=filter,
-                    model_scatter=model_scatter,
-                    plot=plot,
-                    save_plot=save_plot,
-                    metadata=metadata,
-                    logger=logger,
-                    **kwargs)
-    # except:
-        # out = None
-    logger.info("Out is None", out is None)
-    # print("Out is None: ", out is None, pixl, pixr, od, segm)
-    if out is not None:
-        logger.info(f"{out.dtype=}")
-        out['ledge'] = pixl
-        out['redge'] = pixr
-        out['order'] = od
-        out['segm']  = segm
-    else:
-        # parnames = gp_aux.parnames_lfc.copy()
-        # out = aux._prepare_lsf1s(N_data=1,N_sct=0,pars=parnames)
-        out = (None,od,segm)
-        msg = f'Failed to construct IP for order {od}, segment {segm}. ' +\
-              f'Printing x1s: {repr(x1s)} ' +\
-              f'Printing flx1s: {repr(flx1s)} '+\
-              f'Printing err1s: {repr(err1s)}'
-        # print(msg)
-        logger.error(msg)
-    logger.info(f"Finished segment {od}/{segm}")
-    return out
+# NOTE (cleanup): model_1s_4ray used to live here. It had zero callers
+# anywhere in this module and had its own bugs (a malformed logger.info
+# call that would raise on emission, inconsistent None-vs-dict return
+# handling). Removed as dead code. model_1d (below) is the actual
+# per-order Ray worker used by from_spectrum_2d.
 
 # @ray.remote
 # def model_batch(order_data_list, x2d_ref, flx2d_ref, err2d_ref, logger=None,
@@ -756,12 +289,14 @@ def model_1d(order_data_list, x2d_ref, flx2d_ref, err2d_ref, metadata, **kwargs)
         x1s = np.ravel(x2d_ref[od, pixl:pixr])
         flx1s = np.ravel(flx2d_ref[od, pixl:pixr])
         err1s = np.ravel(err2d_ref[od, pixl:pixr])
-        metadata.update({'order':od, 'ledge':pixl, 'redge':pixr})
+        segm  = int(divmod((pixl + pixr) / 2., (pixr - pixl))[0])
+        metadata.update({'order':od, 'segm':segm, 'ledge':pixl, 'redge':pixr})
         # Call the working iterative logic
         lsf_output = model_1s(x1s, flx1s, err1s, metadata=metadata, **kwargs)
         
         if lsf_output is not None:
-            lsf_output.update({'order': od, 'ledge': pixl, 'redge': pixr})
+            lsf_output.update({'order': od, 'segm': segm,
+                               'ledge': pixl, 'redge': pixr})
         results.append(lsf_output)
     return results
 
@@ -785,12 +320,20 @@ def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
     # logger.setLevel(logging.INFO)
     
     verbose             = kwargs.pop('verbose',False)
-    
+    n_in = len(pix1s)
+    od_dbg  = metadata.get('order') if metadata is not None else None
+    seg_dbg = metadata.get('segm') if metadata is not None else None
+
     pix1s, flx1s, err1s = aux.clean_input(pix1s,flx1s,err1s,
                                           sort=True,
                                           verbose=verbose,
                                           filter_n_elements=filter_n_elements)
-    if len(pix1s)==0:
+    n_out = len(pix1s)
+    logger.info(f"order {od_dbg} segm {seg_dbg}: clean_input {n_in} -> {n_out} points")
+    if n_out == 0:
+        logger.warning(
+            f"order {od_dbg} segm {seg_dbg}: ALL {n_in} points rejected by clean_input."
+        )
         return None
     
     
@@ -968,15 +511,15 @@ def construct_tinygp(x,y,y_err,plot=False,
         logger = logger.getChild('construct_tinygp')
     else:
         logger = logging.getLogger(__name__).getChild('construct_tinygp')
-    # if kwargs['metadata']['segment']==10:
+    # if kwargs['metadata']['segm']==10:
     #     print(X,kwargs['metadata'])
     # LSF_solution_nosct = lsfgp.train_LSF_tinygp(X,Y,Y_err)
-    LSF_solution_nosct, loss = lsfgp.train_LSF_multistart_ray(X, Y, Y_err, num_starts=4)
+    LSF_solution_nosct, loss = lsfgp.train_LSF_multistart(X, Y, Y_err, num_starts=4)
     logger.info(f"Found solution without scatter")
     if model_scatter:
         scatter = lsfgp.train_scatter_tinygp(X,Y,Y_err,LSF_solution_nosct)
         # LSF_solution = lsfgp.train_LSF_tinygp(X,Y,Y_err,scatter=scatter)
-        LSF_solution, loss = lsfgp.train_LSF_multistart_ray(X, Y, Y_err, 
+        LSF_solution, loss = lsfgp.train_LSF_multistart(X, Y, Y_err, 
                                                   scatter=scatter, 
                                                   num_starts=4)
         logger.info(f"Found solution with scatter")
@@ -986,10 +529,12 @@ def construct_tinygp(x,y,y_err,plot=False,
         
     Y_data_err = Y_err
     if scatter is not None:
-        S, S_var = lsfgp.rescale_errors(scatter, X, Y_err)
+        S, S_var = lsfgp.rescale_errors(True, scatter, X, Y_err)
         Y_data_err = S
     # print(jnp.sum(jnp.isfinite(Y_data_err))/len(Y_data_err))    
-    gp = lsfgp.build_LSF_GP(LSF_solution,X,Y,Y_data_err)
+    gp = lsfgp.build_LSF_GP(LSF_solution, X, Y_data_err,
+                            use_scatter=(scatter is not None),
+                            scatter=(list(scatter) if scatter is not None else []))
     
     # --------  Save output -------- 
     
@@ -1051,8 +596,7 @@ def construct_tinygp(x,y,y_err,plot=False,
     # centre_estimator = lsfgp.estimate_centre_median
     # centre_estimator = lsfgp.estimate_centre_mean
     
-    lsfcen, lsfcen_err = centre_estimator(X, Y, Y_err,
-                                          LSF_solution,scatter=scatter)
+    lsfcen, lsfcen_err = centre_estimator(X, Y, Y_err, LSF_solution)
     # lsf1s['shift']     = lsfcen
     out_dict = dict(lsf1s=lsf1s, lsfcen=lsfcen, lsfcen_err=lsfcen_err,
                     chisq=chisqdof, rsd=rsd, 
@@ -1079,12 +623,27 @@ def copy_lsf1s_data(copy_from,copy_to):
         try:
             # Data can be directly copied
             copy_to[name] = copy_from[name]
-        except:
-            # Array lengths do not match so copy only where needed
-            len_data  = len(copy_from[name])
-            copy_to[name] = np.nan
-            copy_to[name][slice(0,len_data)] = copy_from[name]
-            
+        except (ValueError, TypeError) as exc:
+            field_dtype = copy_to.dtype[name]
+            is_array_field = field_dtype.shape != ()
+            is_float_field = np.issubdtype(field_dtype.base, np.floating)
+            if is_array_field and is_float_field:
+                # Expected case: e.g. 'x'/'y'/'scatter' from a shorter fit
+                # than the padded allocation — pad with NaN, fill the rest.
+                len_data = len(copy_from[name])
+                copy_to[name] = np.nan
+                copy_to[name][slice(0,len_data)] = copy_from[name]
+            else:
+                # Anything else (scalar or integer field failing to copy)
+                # is a real shape/dtype mismatch, not a padding situation —
+                # fail with a clear message rather than papering over it
+                # with a second, more confusing exception.
+                raise ValueError(
+                    f"copy_lsf1s_data: field '{name}' (dtype={field_dtype}, "
+                    f"from shape={np.shape(copy_from[name])}) could not be "
+                    f"copied directly and is not a paddable float array field."
+                ) from exc
+
     return copy_to
 
 
@@ -1222,28 +781,27 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
     flx2d_ref = ray.put(flx2d)
     err2d_ref = ray.put(err2d)
     logger.info('Ray: spectral arrays placed into Object Store')
-    
-    order_groups = defaultdict(list)
-    for item in iterator:
-        order_groups[item[0]].append(item)
-    
-    order_groups = dict(order_groups)
-    
-    # print([list(segments) for od, segments in order_groups.items()])
+
+    # NOTE: a leftover order-grouped dispatch block used to live here
+    # (building `order_groups` by iterating `iterator` to completion).
+    # SequenceIterator is stateful and single-use — __iter__ returns self,
+    # with no reset — so that walk silently exhausted it before the real
+    # per-segment dispatch loop below ever got a chance to iterate it,
+    # producing futures=[] every time (hence "len(results)=0" in 0 seconds,
+    # regardless of order/segment count). Removed; the per-segment loop is
+    # the only consumer of `iterator` now.
     futures = [
-            model_1d.remote(
-                list(segments), 
-                x2d_ref, flx2d_ref, err2d_ref, 
-                metadata=metadata,
-                numiter=iter_center, 
-                filter=filter,
-                model_scatter=model_scatter,
-                plot=plot,
-                save_plot=save_plot,
-                logger=logger
-                ) 
-            for od, segments in order_groups.items()
-            ]
+        model_1d.remote([(od, pixl, pixr)], 
+                        x2d_ref, flx2d_ref, err2d_ref, 
+                        metadata=metadata,
+                        numiter=iter_center, 
+                        filter=filter,
+                        model_scatter=model_scatter,
+                        plot=plot,
+                        save_plot=save_plot,
+                        logger=logger
+                        ) 
+          for od, pixl, pixr in iterator]
     
     work_len = len(futures)
     time_start = time.time()
@@ -1275,16 +833,24 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
     logger.info(f'{len(results)=}')
     
     for i,lsf1s_out in enumerate(results):
-        logger.info(f"{lsf1s_out['order']=}")
-        logger.info(f"{lsf1s_out['segm']=}")
-        logger.info(f"{lsf1s_out['ledge']=}")
-        logger.info(f"{lsf1s_out['redge']=}")
-        # if lsf1s_out[0] is None:
-        if isinstance(lsf1s_out, tuple) and lsf1s_out is None:
-            msg = f"LSF1s model order {lsf1s_out[1]} segm {lsf1s_out[2]} failed"
-            logger.critical(msg)
-        else:
-            lsf2d[i]=copy_lsf1s_data(lsf1s_out[0],lsf2d[i])
+        if lsf1s_out is None:
+            logger.warning(f"LSF fit failed for segment index {i} "
+                           f"(model_1s returned None) — leaving it empty.")
+            continue
+        logger.debug(f"order={lsf1s_out.get('order')} "
+                     f"segm={lsf1s_out.get('segm')} "
+                     f"ledge={lsf1s_out.get('ledge')} "
+                     f"redge={lsf1s_out.get('redge')}")
+        lsf2d[i]=copy_lsf1s_data(lsf1s_out['lsf1s'],lsf2d[i])
+        # model_1d sets order/segm/ledge/redge/numlines on the OUTER dict
+        # (a sibling of 'lsf1s'), not inside lsf1s_out['lsf1s'] itself —
+        # copy_lsf1s_data only touches the latter, so these have to be
+        # copied explicitly or every fitted segment keeps its default
+        # (order=0 etc) forever, making it unfindable by LSF2d.__getitem__
+        # even though the real GP-fit data is right there.
+        for meta_field in ('order', 'segm', 'ledge', 'redge', 'numlines'):
+            if meta_field in lsf1s_out and meta_field in lsf2d.dtype.names:
+                lsf2d[i][meta_field] = lsf1s_out[meta_field]
     worktime = (time.time() - time_start)
     h, m, s = progress_bar.get_time(worktime)
     logger.info(f"Total time elapsed = {h:02d}h {m:02d}m {s:02d}s")
@@ -1566,9 +1132,11 @@ def evaluate_scatter_GP_from_lsf1s(lsf1s,x_test):
     
 def build_LSF_GP_from_lsf1s(lsf1s,return_scatter=False):
     theta_LSF, data_x, data_y, data_yerr = read.LSF_from_lsf1s(lsf1s)
-    scatter  = read.scatter_from_lsf1s(lsf1s)
-    LSF_gp = lsfgp.build_LSF_GP(theta_LSF, data_x, data_y,
-                                data_yerr,scatter=scatter)
+    scatter     = read.scatter_from_lsf1s(lsf1s)
+    use_scatter = scatter is not None
+    LSF_gp = lsfgp.build_LSF_GP(theta_LSF, data_x, data_yerr,
+                                use_scatter=use_scatter,
+                                scatter=list(scatter) if use_scatter else [])
     if return_scatter:
         return LSF_gp, scatter
     else:
@@ -1576,9 +1144,11 @@ def build_LSF_GP_from_lsf1s(lsf1s,return_scatter=False):
 
 def evaluate_LSF_GP_from_lsf1s(lsf1s,x_test):
     theta_LSF, data_x, data_y, data_yerr = read.LSF_from_lsf1s(lsf1s)
-    scatter = read.scatter_from_lsf1s(lsf1s)
-    LSF_gp = lsfgp.build_LSF_GP(theta_LSF, data_x, data_y,
-                                data_yerr,scatter=scatter)
+    scatter     = read.scatter_from_lsf1s(lsf1s)
+    use_scatter = scatter is not None
+    LSF_gp = lsfgp.build_LSF_GP(theta_LSF, data_x, data_yerr,
+                                use_scatter=use_scatter,
+                                scatter=list(scatter) if use_scatter else [])
     
     return evaluate_GP(LSF_gp, data_y, x_test)
 
@@ -1693,4 +1263,3 @@ def save_most_likely(lsf_filepath,scale,nbo=72,nseg=16,save_filepath=None,
                           version=1,
                           clobber=clobber)  
     return most_likely_lsf2d
-    

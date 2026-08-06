@@ -349,7 +349,8 @@ def mread_outfile(filelist,extensions,version=None,avflux=False,
 #==============================================================================
 allowed_hdutypes = ['linelist','flux','background','error','weights','envelope',
                     'coeff_gauss','coeff_lsf','wavesol_gauss','wavesol_lsf',
-                    'model_gauss','model_lsf','residuals_gauss','residuals_lsf',
+                    'model_gauss','model_lsf','model_lsf_vel',
+                    'residuals_gauss','residuals_lsf',
                     'wavesol_2pt_lsf','wavesol_2pt_gauss','noise',
                     'wavereference', 'extrema', 'line_positions']
 def new_fits(filepath,dirpath=None):
