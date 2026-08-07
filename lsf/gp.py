@@ -19,6 +19,7 @@ import gc
 import logging
 import ray
 from . import gp_aux
+from . import batch as lsfbatch
 
 
 # ── Loss functions ────────────────────────────────────────────────────────────
@@ -160,8 +161,46 @@ def train_LSF_multistart(X          : jnp.ndarray,
     )
     bounds = (lower, upper)
 
+    # Pad to a fixed shape (batch.py's MAX_SEG_LEN) before the vmap'd
+    # optimizer, so every call — across every segment, and across every
+    # one of model_1s's outlier-rejection iterations, which reshapes the
+    # array each time — presents JAX with the SAME input shape. Without
+    # this, JAX traces and compiles a brand-new XLA program (the whole
+    # vmap'd multi-start LBFGSB + GP kernel construction) for every
+    # distinct length it sees. Since segment length varies both across
+    # segments (~568-570, since 9111 doesn't divide evenly by 16) and
+    # shrinks on every outlier-removal pass within a single segment,
+    # that meant essentially never getting a JIT cache hit — the direct
+    # cause of both the multi-minute "Very slow compile?" XLA warnings
+    # and the memory pressure that triggered repeated OOM kills (compiling
+    # is itself memory-hungry, and none of that compiled work was ever
+    # reused). A0/x_std/y_std/starts above are computed from the TRUE,
+    # unpadded X/Y — only the optimizer call itself needs the fixed shape.
+    #
+    # Padding with Y_err=1e9 at the padded positions, rather than
+    # threading an explicit mask through loss_LSF, is not an
+    # approximation: see loss_LSF's own docstring — a GP's log marginal
+    # likelihood is already insensitive to a point with near-infinite
+    # observation noise, so this is a correctness-neutral way to mask
+    # points, not a workaround.
+    n = int(X.shape[0])
+    if n > lsfbatch.MAX_SEG_LEN:
+        raise ValueError(
+            f"Segment length {n} exceeds batch.MAX_SEG_LEN="
+            f"{lsfbatch.MAX_SEG_LEN}. Increase MAX_SEG_LEN in "
+            f"harps/lsf/batch.py to accommodate segments this large."
+        )
+    elif n < lsfbatch.MAX_SEG_LEN:
+        X_pad, Y_pad, Yerr_pad, _mask = lsfbatch._pad_one(
+            np.asarray(X), np.asarray(Y), np.asarray(Y_err),
+            max_len=lsfbatch.MAX_SEG_LEN,
+        )
+        X_fit, Y_fit, Yerr_fit = jnp.array(X_pad), jnp.array(Y_pad), jnp.array(Yerr_pad)
+    else:
+        X_fit, Y_fit, Yerr_fit = X, Y, Y_err
+
     params_batched, losses_batched = vectorized_run_lsf_optimization_local(
-        starts, X, Y, Y_err, use_scatter, bounds, scatter_list, maxiter
+        starts, X_fit, Y_fit, Yerr_fit, use_scatter, bounds, scatter_list, maxiter
     )
     # Guard against a start that diverged to NaN loss
     safe_losses = jnp.where(jnp.isfinite(losses_batched),
