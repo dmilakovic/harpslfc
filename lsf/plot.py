@@ -782,15 +782,15 @@ def plot_numerical_model(ax,nummodel,*args,**kwargs):
     x = nummodel['x']
     y = nummodel['y']
     numseg_sent,npts = np.shape(x)
-    if numseg_sent==1:
-        x = x[0]
-        y = y[0]
-        ax.plot(x,y,*args,**kwargs)
-    if numseg_sent>5:
-        colors = plt.cm.jet(np.linspace(0, 1, numseg_sent))
-        for i,(x_,y_) in enumerate(zip(x,y)):
-            ax.plot(x_,y_,color=colors[i],*args,**kwargs,label=f'Segment {i+1}')
-    
+    # Plot every segment uniformly, regardless of count. The previous
+    # version had two separate `if` blocks -- one for numseg_sent==1, one
+    # for numseg_sent>5 -- not linked by elif, with NO branch at all for
+    # 2-5 segments, silently rendering nothing in that range (e.g. the
+    # numseg=4 default used by test_construct_lsf_espresso.py's
+    # smoke_test()).
+    user_label = kwargs.pop('label', None)
+    colors = plt.cm.jet(np.linspace(0, 1, max(numseg_sent, 2)))
+    for i, (x_, y_) in enumerate(zip(x, y)):
+        label = user_label if numseg_sent == 1 else f'Segment {i+1}'
+        ax.plot(x_, y_, *args, color=colors[i], label=label, **kwargs)
     return ax
-    
-        

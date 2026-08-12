@@ -34,32 +34,51 @@ def read_lsf_from_fits(filepath,extname,version):
     return lsf2d
 
 
+def write_lsf_to_fits(data, filepath, extname, version=None, clobber=False,
+                      key_fields=None):
+    """
+    Parameters
+    ----------
+    key_fields : tuple of str, optional
+        If given (e.g. ('order','segm')), performs a KEY-AWARE merge
+        instead of the default blind positional overwrite: existing rows
+        whose key matches a row in `data` are REPLACED; rows in `data`
+        with no matching existing key are APPENDED (the table is resized
+        to fit, via a plain fitsio .write() with no firstrow= -- fitsio
+        correctly resizes/replaces the whole extension's content when
+        called that way; this is not a per-row in-place patch, it's a
+        full rewrite of the extension with the merged array).
 
-def write_lsf_to_fits(data,filepath,extname,version=None,clobber=False):
+        Without this (the default, None), the ORIGINAL behavior is
+        unchanged: overwrite exactly the first len(data) rows in place,
+        regardless of order/segment identity. That default is what
+        callers without a natural row key (e.g. linelist, where
+        overwrite-in-place on rerun is the desired behavior) still get.
+
+        Per-order LSF construction (pixel_gp/velocity_gp/pixel_model/
+        velocity_model, all of which have 'order'+'segm') should pass
+        key_fields=('order','segm') -- otherwise, running for a NEW
+        order just overwrites whatever's in rows [0, numseg) regardless
+        of which order that data actually belonged to, silently
+        destroying it. See conversation history for the concrete
+        reproduction of this.
+    """
     print(filepath)
-    # dirpath=dirpath if dirpath is not None else hs.get_dirname('lsf')
-    # filepath = os.path.join(dirpath,filename)
-    with FITS(filepath,mode='rw',clobber=clobber) as hdu:
+    with FITS(filepath, mode='rw', clobber=clobber) as hdu:
         status = 'failed'
         try:
-            existing_len = len(hdu[extname,version].read())
+            existing = hdu[extname, version].read()
             exists = True
         except Exception:
             exists = False
-            existing_len = None
+            existing = None
 
         try:
-            if exists:
-                # IMPORTANT: this extension/version already has data — from
-                # this run's earlier write, or from an entirely separate
-                # PRIOR run of the pipeline. .append() used to be tried
-                # here, which succeeds silently whenever the extension
-                # already exists and just grows the table, tacking the new
-                # rows on AFTER whatever was already there instead of
-                # replacing it. Every rerun with clobber=False therefore
-                # accumulates another copy, with the OLDEST data (often
-                # stale defaults from a partial/failed earlier run) sitting
-                # at the front.
+            if not exists:
+                hdu.write(data, extname=extname, extver=version)
+                action = 'write'
+            elif key_fields is None:
+                existing_len = len(existing)
                 if existing_len != len(data):
                     print(f"WARNING: '{extname}' version {version} already "
                          f"has {existing_len} rows, but the new data has "
@@ -69,22 +88,65 @@ def write_lsf_to_fits(data,filepath,extname,version=None,clobber=False):
                          f"from a previous run will remain. If that's not "
                          f"what you want, delete the file or pass "
                          f"clobber=True for a clean rewrite.")
-                hdu[extname,version].write(data, firstrow=0)
+                hdu[extname, version].write(data, firstrow=0)
                 action = 'overwrite'
             else:
-                hdu.write(data,extname=extname,extver=version)
-                action = 'write'
+                combined, n_replaced, n_appended = _merge_rows_by_key(
+                    existing, data, key_fields
+                )
+                print(f"'{extname}' version {version}: merging by "
+                     f"{key_fields} -- {n_replaced} existing row(s) "
+                     f"replaced, {n_appended} new row(s) appended "
+                     f"({len(existing)} -> {len(combined)} total rows).")
+                hdu[extname, version].write(combined)   # no firstrow= -> resizes
+                action = 'merge'
             status = 'done'
         except Exception:
-            # Fall back to creating a fresh extension only if we genuinely
-            # couldn't write to an existing one for some other reason.
-            hdu.write(data,extname=extname,extver=version)
+            hdu.write(data, extname=extname, extver=version)
             action = 'write (fallback)'
             status = 'done'
         finally:
             hdu.close()
             print(f"Data {action} to {filepath} {status}.")
     return None
+
+
+def _merge_rows_by_key(existing, new, key_fields):
+    """
+    existing, new : structured numpy arrays with the same dtype
+    key_fields    : tuple of field names identifying a row uniquely
+                    (e.g. ('order','segm'))
+
+    Returns (combined, n_replaced, n_appended):
+      combined   : existing rows NOT matched by any key in `new`,
+                   followed by every row of `new` (so a row being
+                   updated moves to wherever it appears in `new`,
+                   not staying at its old position -- this is a
+                   feature, not just a side effect: it keeps rows for
+                   one order contiguous instead of scattering an
+                   updated order's rows back into wherever they were
+                   first written).
+      n_replaced : rows in `new` whose key already existed in `existing`
+      n_appended : rows in `new` whose key is new
+    """
+    def keys_of(arr):
+        return set(zip(*[arr[f].tolist() for f in key_fields]))
+
+    new_keys = keys_of(new)
+    if len(existing) == 0:
+        keep_mask = np.zeros(0, dtype=bool)
+    else:
+        existing_keys = list(zip(*[existing[f].tolist() for f in key_fields]))
+        keep_mask = np.array([k not in new_keys for k in existing_keys])
+
+    existing_keys_set = keys_of(existing) if len(existing) else set()
+    new_row_keys = list(zip(*[new[f].tolist() for f in key_fields]))
+    n_replaced = sum(1 for k in new_row_keys if k in existing_keys_set)
+    n_appended = len(new) - n_replaced
+
+    kept_existing = existing[keep_mask] if len(existing) else existing
+    combined = np.concatenate([kept_existing, new])
+    return combined, n_replaced, n_appended
 
 
 def convert_version(iteration,interpolate,model_scatter):
@@ -188,3 +250,5 @@ def copy_extension_to_new(infile,outfile,extname,extver,new_extver='same',
     message = f"Copying {extname} {extver} from {infile} to {outfile}"
     print(f"{message} {status}")
     return success
+
+

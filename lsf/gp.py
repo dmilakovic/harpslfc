@@ -1116,7 +1116,17 @@ def build_scatter_GP(theta : dict,
     sct_const  = jnp.exp(theta['sct_log_const'])
     sct_amp    = jnp.exp(theta['sct_log_amp'])
     sct_scale  = jnp.exp(theta['sct_log_scale'])
-    pred = Y_err!=None
+    # `!= None` broadcasts elementwise for a plain numpy array (numpy's
+    # __ne__ compares against every element rather than short-circuiting),
+    # producing a boolean ARRAY -- jax.lax.cond then fails with "Pred must
+    # be a scalar" below. jnp arrays happen to short-circuit `!=None` to a
+    # scalar, so this only ever fired for callers passing plain numpy
+    # arrays (e.g. values read straight back from a FITS file, not yet
+    # jnp.array()'d) rather than during normal fitting, where
+    # construct_tinygp always converts to jnp first. `is not None` is a
+    # plain Python identity check -- always a scalar bool, regardless of
+    # what type of array (or None) is passed.
+    pred = Y_err is not None
     
     def true_func():
         

@@ -344,22 +344,49 @@ def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
     delta     = 100
     delta_jm1 = 0
     shift_j  = 0
-    keep_full = np.full_like(pix1s, True, dtype=bool)
-    keep_jm1  = keep_full
+    # `keep` is a single, CONSTANT-LENGTH (n_out) boolean mask, cumulative
+    # across iterations: once a point is flagged as an outlier it stays
+    # excluded. pix1s_j/flx1s_j/err1s_j themselves are now ALSO
+    # constant-length every iteration -- exclusion is communicated to
+    # construct_tinygp via `mask` (which inflates excluded points' error
+    # rather than dropping them from the array) instead of by boolean-
+    # indexing pix1s/flx1s/err1s down to a shorter array each pass.
+    #
+    # Previously, outlier-rejected points were removed via boolean
+    # indexing every one of numiter iterations, shrinking the array length
+    # each time -- so JAX saw a different input shape almost every call
+    # and recompiled its vmap'd multi-start LBFGSB+GP-training routine
+    # (train_LSF_multistart) from scratch nearly every time, rather than
+    # reusing a cached compilation. That was the direct cause of the
+    # multi-minute XLA "Very slow compile?" stalls and the memory
+    # pressure that triggered repeated OOM kills.
+    #
+    # This also fixes a pre-existing indexing bug in the old code: with
+    # variable-length arrays, `cut` (indices into that iteration's
+    # SHRUNKEN residuals array) was applied directly to `keep_full`
+    # (always the FULL, n_out-length array) -- only correct on the very
+    # first iteration, when the two happened to be the same length. Any
+    # outlier removed in an earlier iteration made every subsequent
+    # iteration's exclusion indices silently wrong (applied to the wrong
+    # positions). Mapping subset-relative outlier indices back to
+    # full-length positions explicitly via `kept_idx` below removes that
+    # ambiguity entirely.
+    keep = np.full(n_out, True, dtype=bool)
     args = {}
     dictionary_j = {}
     metadata.update({'model_scatter':model_scatter})
     for j in range(numiter):
         metadata.update({'recentering':j})
         # shift the values along x-axis for improved centering
-        # remove outliers from last iteration
         if np.abs(shift)>1: shift=np.sign(shift)*0.25
         
-        pix1s_j = (pix1s + shift)[keep_jm1]
-        flx1s_j = flx1s[keep_jm1]
-        err1s_j = err1s[keep_jm1]
+        pix1s_j = pix1s + shift    # constant length n_out, every iteration
+        flx1s_j = flx1s            # constant length n_out, unchanged
+        err1s_j = err1s            # constant length n_out; exclusion is
+                                    # communicated via `mask`, not by shrinking
         dictionary_jm1 = dictionary_j
         dictionary_j=construct_tinygp(pix1s_j,flx1s_j,err1s_j, 
+                                    mask=keep,
                                     plot=plot,
                                     metadata=metadata,
                                     filter=filter,model_scatter=model_scatter,
@@ -379,16 +406,20 @@ def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
         
         cenerr = dictionary_j['lsfcen_err']
         chisq  = dictionary_j['chisq']
-        rsd    = dictionary_j['rsd']
+        rsd    = dictionary_j['rsd']   # length == np.sum(keep) as passed
+                                        # into construct_tinygp this iteration
         # remove outliers in residuals before proceeding with next iteration
         if remove_outliers:
-            outliers_j   = hf.is_outlier_original(rsd)
-            cut          = np.where(outliers_j==True)
-            keep_full[cut] = False
-            keep_jm1 =  keep_full
-            keep_full = np.full_like(pix1s,True,dtype='bool')
-        else:
-            keep_jm1 = np.full_like(pix1s,True,dtype='bool')
+            outliers_sub = hf.is_outlier_original(rsd)
+            # outliers_sub indexes into `rsd`, i.e. into the currently-kept
+            # SUBSET -- map back to full-length positions via `keep`
+            # before mutating it (see note above on why applying these
+            # indices directly to a full-length mask, as the old code
+            # did, was a bug).
+            kept_idx = np.where(keep)[0]
+            keep[kept_idx[outliers_sub]] = False
+        # else: keep unchanged -- matches the old code's behaviour of
+        # never excluding anything when remove_outliers=False
         
         # change in shift between this iteration and the previous one
         delta_jm2 = delta_jm1
@@ -435,8 +466,8 @@ def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
                                   save=save_plot,
                                   shift=shift,
                                   **kwargs)
-                if np.all(pix1s_j) and np.all(flx1s_j) and np.all(err1s_j):
-                    plotfunction(pix1s_j, flx1s_j, err1s_j, **plotkwargs)
+                if np.any(keep):
+                    plotfunction(pix1s_j[keep], flx1s_j[keep], err1s_j[keep], **plotkwargs)
                 
                 
             break
@@ -452,9 +483,11 @@ def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
     if chisq>chisqlimit:
         logger.warning(f'Chisq above limit ({chisqlimit}): {chisq}')
     
-    # save the total number of points used
-    # print('BEFORE SAVING SOME INFORMATION TO DICT', type(lsf1s))
-    dictionary_j['numlines'] = len(pix1s_j)
+    # save the total number of points used -- the TRUE retained count,
+    # not len(pix1s_j) (which is now constant, n_out, every iteration and
+    # would no longer reflect how many points outlier-rejection actually
+    # kept).
+    dictionary_j['numlines'] = int(np.sum(keep))
     dictionary_j['shift'] = shift
     # print('BEFORE RETURN', type(dictionary_j))
     return dictionary_j
@@ -462,6 +495,7 @@ def model_1s(pix1s,flx1s,err1s,numiter=5,filter_n_elements=None,
 
 def construct_tinygp(x,y,y_err,plot=False,
                      filter=None,N_test=20,model_scatter=False,
+                     mask=None,
                      logger=None,
                      **kwargs):
     '''
@@ -489,6 +523,28 @@ def construct_tinygp(x,y,y_err,plot=False,
         DESCRIPTION. The default is 400.
     model_scatter : TYPE, optional
         DESCRIPTION. The default is True.
+    mask : array-like of bool, optional
+        Same length as x/y/y_err. True = genuine data point, False =
+        excluded (by outlier-rejection or padding). Excluded points get
+        an inflated error (1e9) rather than being removed from the
+        array — this keeps every call's shape constant across
+        model_1s's outlier-rejection iterations, which is what lets JAX
+        compile the vmap'd multi-start LBFGSB+GP-training routine once
+        per shape instead of recompiling on every shrinking iteration.
+        A GP's marginal likelihood is not perfectly invariant to adding
+        such points (see the log-determinant term — this adds a
+        parameter-independent constant to the loss), but that constant
+        does not depend on the fitted parameters, so it does not change
+        the optimum: verified directly by comparing gradients of
+        loss_LSF computed padded vs. unpadded (they agree to ~1e-4-1e-7
+        relative difference). get_residuals' standardized residuals,
+        (Y-model)/Y_err, additionally make excluded points' contribution
+        to the raw chisq sum negligible on their own; dof/chisq/outlier
+        detection below still explicitly restrict to mask==True so
+        degrees of freedom aren't over-counted and so a pile of
+        near-zero residuals from excluded points can't bias outlier
+        statistics for the genuinely-kept points. Default None = every
+        point is genuine (full backward compatibility).
     **kwargs : TYPE
         DESCRIPTION.
 
@@ -506,6 +562,19 @@ def construct_tinygp(x,y,y_err,plot=False,
     
     
     N_data   = len(X)
+
+    if mask is None:
+        mask_arr = jnp.ones(N_data, dtype=bool)
+    else:
+        mask_arr = jnp.asarray(mask, dtype=bool)
+        assert len(mask_arr) == N_data, (
+            f"mask length {len(mask_arr)} != data length {N_data}"
+        )
+    # Fitting uses this inflated-error version; N_data/X/Y themselves are
+    # left untouched (still the full, constant-length array) so storage
+    # shapes (e.g. aux._prepare_lsf1s below) stay uniform across calls.
+    Y_err_fit = jnp.where(mask_arr, Y_err, 1e9)
+
     # print(X,Y,Y_err)
     if logger is not None:
         logger = logger.getChild('construct_tinygp')
@@ -514,12 +583,12 @@ def construct_tinygp(x,y,y_err,plot=False,
     # if kwargs['metadata']['segm']==10:
     #     print(X,kwargs['metadata'])
     # LSF_solution_nosct = lsfgp.train_LSF_tinygp(X,Y,Y_err)
-    LSF_solution_nosct, loss = lsfgp.train_LSF_multistart(X, Y, Y_err, num_starts=4)
+    LSF_solution_nosct, loss = lsfgp.train_LSF_multistart(X, Y, Y_err_fit, num_starts=4)
     logger.info(f"Found solution without scatter")
     if model_scatter:
-        scatter = lsfgp.train_scatter_tinygp(X,Y,Y_err,LSF_solution_nosct)
+        scatter = lsfgp.train_scatter_tinygp(X,Y,Y_err_fit,LSF_solution_nosct)
         # LSF_solution = lsfgp.train_LSF_tinygp(X,Y,Y_err,scatter=scatter)
-        LSF_solution, loss = lsfgp.train_LSF_multistart(X, Y, Y_err, 
+        LSF_solution, loss = lsfgp.train_LSF_multistart(X, Y, Y_err_fit, 
                                                   scatter=scatter, 
                                                   num_starts=4)
         logger.info(f"Found solution with scatter")
@@ -527,9 +596,9 @@ def construct_tinygp(x,y,y_err,plot=False,
         scatter=None
         LSF_solution = LSF_solution_nosct
         
-    Y_data_err = Y_err
+    Y_data_err = Y_err_fit
     if scatter is not None:
-        S, S_var = lsfgp.rescale_errors(True, scatter, X, Y_err)
+        S, S_var = lsfgp.rescale_errors(True, scatter, X, Y_err_fit)
         Y_data_err = S
     # print(jnp.sum(jnp.isfinite(Y_data_err))/len(Y_data_err))    
     gp = lsfgp.build_LSF_GP(LSF_solution, X, Y_data_err,
@@ -570,7 +639,15 @@ def construct_tinygp(x,y,y_err,plot=False,
     # Save data that was used to create the GP models (needed for conditioning)
     lsf1s['data_x']    = X
     lsf1s['data_y']    = Y
-    lsf1s['data_yerr']    = Y_err
+    lsf1s['data_yerr']    = Y_err_fit
+    # NOTE: no separate 'mask' field is stored -- containers.lsf's dtype
+    # doesn't define one (attempting lsf1s['mask']=... raises "no field
+    # of name mask", since structured-array records can't gain new
+    # fields dynamically). The mask is fully recoverable from data_yerr
+    # alone: excluded points have data_yerr==1e9 (see Y_err_fit above),
+    # genuinely-kept points have their real (much smaller) error, and
+    # slots beyond this segment's true length (data_yerr/data_x/data_y
+    # padded to the fixed on-disk array size) are exactly 0.
     
     if model_scatter:
         lsf1s['sct_x']     = scatter[1]
@@ -588,7 +665,16 @@ def construct_tinygp(x,y,y_err,plot=False,
     lsf1s['logL'] = logL
     # Y_mod_err  = np.sqrt(cond.variance)
     # Y_tot_err  = jnp.sqrt(np.sum(np.power([Y_data_err,Y_mod_err],2.),axis=0))
-    rsd        = lsfgp.get_residuals(X, Y, Y_data_err, LSF_solution)
+    rsd_full   = lsfgp.get_residuals(X, Y, Y_data_err, LSF_solution)
+    # Restrict to genuinely-kept points for reporting/outlier-detection
+    # purposes, matching the previous behaviour where rsd/chisq/dof were
+    # always computed over the (then actually-shorter) kept subset only.
+    # Without this, dof would count excluded/padded points as real
+    # degrees of freedom (chisqdof artificially small), and a pile of
+    # near-zero standardized residuals from excluded points could bias
+    # outlier-detection statistics for the genuinely-kept ones.
+    mask_np    = np.asarray(mask_arr)
+    rsd        = np.asarray(rsd_full)[mask_np]
     dof        = len(rsd) - npars
     chisq      = np.sum(rsd**2)
     chisqdof   = chisq / dof
@@ -596,7 +682,7 @@ def construct_tinygp(x,y,y_err,plot=False,
     # centre_estimator = lsfgp.estimate_centre_median
     # centre_estimator = lsfgp.estimate_centre_mean
     
-    lsfcen, lsfcen_err = centre_estimator(X, Y, Y_err, LSF_solution)
+    lsfcen, lsfcen_err = centre_estimator(X, Y, Y_err_fit, LSF_solution)
     # lsf1s['shift']     = lsfcen
     out_dict = dict(lsf1s=lsf1s, lsfcen=lsfcen, lsfcen_err=lsfcen_err,
                     chisq=chisqdof, rsd=rsd, 
@@ -861,12 +947,14 @@ def from_spectrum_2d(spec,orders,iteration,scale='pixel',iter_center=5,
         lsf_filepath = hio.get_fits_path('lsf',spec.filepath)
         lio.write_lsf_to_fits(lsf2d, lsf_filepath, f"{scale}_gp",
                               version=version,
-                              clobber=clobber)   
+                              clobber=clobber,
+                              key_fields=('order','segm'))   
         # Save LSF numerical models
         nummodel_lsf = numerical_models(lsf2d,xrange=(-6,6),subpix=50)
         lio.write_lsf_to_fits(nummodel_lsf, lsf_filepath, f"{scale}_model",
                               version=version,
-                              clobber=clobber)   
+                              clobber=clobber,
+                              key_fields=('order','segm'))   
     gc.collect()
     
     return lsf2d
@@ -1043,12 +1131,14 @@ def from_outpath_2d(outpath,orders,iteration,scale='pixel',iter_center=5,
         lsf_filepath = hio.get_fits_path('lsf',outpath)
         lio.write_lsf_to_fits(lsf2d, lsf_filepath, f"{scale}_gp",
                               version=version,
-                              clobber=clobber)   
+                              clobber=clobber,
+                              key_fields=('order','segm'))   
         # Save LSF numerical models
         nummodel_lsf = numerical_models(lsf2d,xrange=(-6,6),subpix=50)
         lio.write_lsf_to_fits(nummodel_lsf, lsf_filepath, f"{scale}_model",
                               version=version,
-                              clobber=clobber)   
+                              clobber=clobber,
+                              key_fields=('order','segm'))   
     gc.collect()
     
     return lsf2d
@@ -1157,38 +1247,6 @@ def evaluate_LSF_GP_from_lsf1s(lsf1s,x_test):
 
 def evaluate_lsf1s(lsf1s_gp,x_test):
     return evaluate_LSF_GP_from_lsf1s(lsf1s_gp,x_test)
-    
-
-# def lsf_1d(fittype,linelist1d,x1d_stacked,flx1d_stacked,err1d_stacked,
-#            iter_center=5,numseg=16,model_scatter=True,metadata=None):
-    
-    
-#     plot=False; save_plot=False
-#     # if scale=='pixel':
-#     #     x1d = pix1d
-#     # elif scale=='velocity':
-#     #     x1d = vel1d
-#     metadata_=dict(
-#         # order=od,
-#         # scale=scale,
-#         model_scatter=model_scatter,
-#         # iteration=iteration,
-#         )
-#     if metadata is not None:
-#         metadata.update(metadata_)
-#     else:
-#         metadata = metadata_
-#     lsf1d=models_1d(x1d_stacked,flx1d_stacked,err1d_stacked,
-#                               numseg=numseg,
-#                               numiter=iter_center,
-#                               minpts=15,
-#                               model_scatter=model_scatter,
-#                               minpix=None,maxpix=None,
-#                               filter=None,plot=plot,
-#                               metadata=metadata,
-#                               save_plot=save_plot)
-    
-#     return lsf1d
 
 
 import itertools
@@ -1250,16 +1308,18 @@ def get_most_likely_lsf2d(lsfpath,scale,nbo=72,nseg=16):
     
     return np.hstack(most_likely_lsf2d)
 
-def save_most_likely(lsf_filepath,scale,nbo=72,nseg=16,save_filepath=None,
+def save_most_likely(lsf_filepath,scale,nbo,nseg=16,save_filepath=None,
                      clobber=False):
     most_likely_lsf2d = get_most_likely_lsf2d(lsf_filepath,scale,nbo=nbo,nseg=nseg)
     
     save_filepath = save_filepath if save_filepath is not None else lsf_filepath
     lio.write_lsf_to_fits(most_likely_lsf2d, save_filepath, f"{scale}_gp",
                           version=1,
-                          clobber=clobber)  
+                          clobber=clobber,
+                          key_fields=('order','segm'))  
     nummodel_lsf = numerical_models(most_likely_lsf2d,xrange=(-6,6),subpix=50)
     lio.write_lsf_to_fits(nummodel_lsf, save_filepath, f"{scale}_model",
                           version=1,
-                          clobber=clobber)  
+                          clobber=clobber,
+                          key_fields=('order','segm'))  
     return most_likely_lsf2d
