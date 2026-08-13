@@ -36,7 +36,6 @@ line's exactly-known wavelength (see section 3).
 """
 
 import numpy as np
-from scipy.optimize import least_squares
 from numpy.polynomial import chebyshev as Chebyshev
 
 from lfc.fitting.gp import gaussian_process_smooth
@@ -44,8 +43,8 @@ from lfc.fitting.gp import gaussian_process_smooth
 SPEED_OF_LIGHT = 2.99792458e8       # m / s
 C_LIGHT_KMS = SPEED_OF_LIGHT / 1e3  # km / s
 
-SPECTRUM_FILE = '/Users/dmilakov/software/harps/lsf/test/example_data_ESPRESSO_od=50.txt'
-LINES_FILE = '/Users/dmilakov/software/harps/lsf/test/line_positions_ESPRESSO_od=50.txt'
+SPECTRUM_FILE = '/Users/dmilakov/software/harps/lsf/test/example_data_ESPRESSO_od=150.txt'
+LINES_FILE = '/Users/dmilakov/software/harps/lsf/test/line_positions_ESPRESSO_od=150.txt'
 
 
 # =========================================================================
@@ -443,27 +442,43 @@ def gaussian_mean(u_grid, sigma):
 
 
 # =========================================================================
+# =========================================================================
 # 5. Width model: sigma(x), now a velocity width (km/s)
 # =========================================================================
-# Still represented as a low-order Chebyshev polynomial in (rescaled)
-# PIXEL position -- position along the order is still naturally described
-# by pixel/wavelength, only the WIDTH value itself changes units.
+# sigma(x) is represented directly on a dense pixel grid, fit via
+# gp.py's gaussian_process_smooth -- the same approach just used for
+# dispersion, and for the same reason: each line's pixel window gives a
+# cheap, closed-form LOCAL correction (here, to log(sigma), so sigma
+# stays positive after exponentiating) via linearising around the
+# current estimate, and gaussian_process_smooth fits a smooth curve
+# through (line_position, log_sigma + correction, uncertainty) directly.
+# Off-grid evaluation (needed at positions other than the M comb lines,
+# e.g. the order-midpoint reference used by the identifiability guard)
+# uses np.interp against the fitted grid, the same pattern already used
+# for the envelope and background above.
 
-WIDTH_POLY_ORDER = 2
+WIDTH_MIN_LENGTH_SCALE = 2000  # pixels; a floor alone was not sufficient to
+                                  # fix the jagged FWHM(x) reported -- see
+                                  # WIDTH_WARMUP_CALLS below and the docstring
+                                  # of fit_width for why
+WIDTH_MAX_LENGTH_SCALE = 1e4    # pixels
+
 _initial_width_kms = 1.3 * _v_per_pixel_typical  # was 1.3 PIXELS previously;
                                                     # converted to the
                                                     # equivalent km/s using
                                                     # the typical scale, as a
                                                     # starting guess only
 
-def width_design_matrix(x, order=WIDTH_POLY_ORDER):
-    return Chebyshev.chebvander(rescaled_position(x), order)
+def width(x, log_sigma_grid):
+    """ sigma(x), from a log(sigma) grid already fit at the pixel values
+        in `pixel` (see fit_width below) -- interpolated the same way
+        envelope(x)/background(x) interpolate their own GP-fitted grids. """
+    return np.maximum(np.exp(np.interp(x, pixel.astype(float), log_sigma_grid)),
+                       0.05 * _v_per_pixel_typical)
 
-def width(x, width_coeffs):
-    return np.maximum(width_design_matrix(x) @ width_coeffs, 0.05 * _v_per_pixel_typical)
-
-width_coeffs = np.linalg.lstsq(width_design_matrix(peak_pixel),
-                                np.full(n_lines, _initial_width_kms), rcond=None)[0]
+width_coeffs = np.full(n_pixels, np.log(_initial_width_kms))  # initial grid,
+                                                                 # refined by
+                                                                 # fit_width below
 
 
 # =========================================================================
@@ -645,22 +660,93 @@ def fit_shape_departure(line_position, width_coeffs, v_pix):
     return solution.reshape(SHAPE_POLY_ORDER + 1, n_grid)
 
 
-def fit_width(shape_coeffs, width_coeffs_initial, line_position, v_pix):
+WIDTH_WARMUP_CALLS = 2  # number of OUTER JOINT iterations' worth of fit_width
+                          # calls to let the length scale fit freely before
+                          # freezing it (see the extended discussion below)
+_width_gp_state = {'calls': 0, 'frozen_length_scale': None}
+
+def fit_width(shape_coeffs, log_sigma_grid_init, line_position, v_pix,
+              n_outer_steps=3, step_size=0.5, finite_difference_step=1e-3):
+    """ Refines the width grid (log(sigma) at every pixel) the same way
+        fit_dispersion refines position: each line's pixel window gives a
+        cheap local correction (here to log(sigma), via linearising the
+        model's response to a small multiplicative change in sigma), and
+        gaussian_process_smooth fits the smooth curve through
+        (line_position, log_sigma + correction, uncertainty) directly.
+
+        The length scale is fit freely only for the first
+        WIDTH_WARMUP_CALLS calls, then FROZEN at whatever value it found
+        and reused for every subsequent call, rather than being re-fit
+        from scratch every time. This is different from the equivalent
+        dispersion function, which re-fits its length scale every call
+        with no trouble -- and the reason for the difference matters: the
+        log(sigma) correction signal is small (order 0.02-0.1) and
+        comparable to its own noise, unlike dispersion's strong, stable
+        trend, so each fresh re-fit of the width GP's length scale can
+        land on a noticeably different value (confirmed directly: 10000,
+        10000, then 6243 pixels across just 3 calls, despite a stated
+        floor of 2000). Since fit_width is called repeatedly across many
+        outer iterations with a DAMPED update each time, a length scale
+        that wanders between calls means the final grid is a superposition
+        of several different "few-broad-bump" patterns, each from a
+        different call, rather than one consistent smooth curve -- which
+        is what actually produced the jagged-looking FWHM(x), not a
+        length-scale bound being violated (checked directly: the bound
+        was respected every time; the instability was between calls, not
+        within any single one). Freezing removes that source of
+        inconsistency directly. """
     shape_weight = Chebyshev.chebvander(rescaled_position(line_position), SHAPE_POLY_ORDER)
     departure = shape_weight @ shape_coeffs
+    log_sigma_grid = log_sigma_grid_init.copy()
+    frozen = _width_gp_state['frozen_length_scale']
 
-    def residual(width_coeffs):
-        line_width = width(line_position, width_coeffs)
-        chunks = []
+    for _ in range(n_outer_steps):
+        sigma_current = width(line_position, log_sigma_grid)
+        log_sigma_current = np.log(sigma_current)
+
+        delta = np.zeros(n_lines)
+        delta_err = np.zeros(n_lines)
         for m in range(n_lines):
             idx = fit_window(line_position[m])
             conv = convolution_matrix(line_position[m], idx, v_pix[m])
-            lsf = gaussian_mean(u, line_width[m]) + departure[m]
-            chunks.append((conv @ lsf - flux[idx]) / flux_err[idx])
-        return np.concatenate(chunks)
+            lsf = gaussian_mean(u, sigma_current[m]) + departure[m]
+            model_value = conv @ lsf
 
-    fit = least_squares(residual, width_coeffs_initial)
-    return fit.x
+            sigma_perturbed = sigma_current[m] * np.exp(finite_difference_step)
+            lsf_perturbed = gaussian_mean(u, sigma_perturbed) + departure[m]
+            model_perturbed = conv @ lsf_perturbed
+            model_derivative = (model_perturbed - model_value) / finite_difference_step
+
+            weight = inverse_variance[idx]
+            denominator = np.sum(model_derivative**2 * weight)
+            if denominator > 1e-12:
+                delta[m] = np.sum(model_derivative * weight * (flux[idx] - model_value)) / denominator
+                naive_err = 1.0 / np.sqrt(denominator)
+                residual = (model_value + model_derivative * delta[m] - flux[idx]) / flux_err[idx]
+                dof = max(len(idx) - 1, 1)
+                chi2_reduced = np.sum(residual**2) / dof
+                delta_err[m] = naive_err * np.sqrt(max(chi2_reduced, 1.0))
+            else:
+                delta[m] = 0.0
+                delta_err[m] = np.inf
+
+        target = log_sigma_current + delta
+        if frozen is not None:
+            min_ls, max_ls = frozen, frozen
+        else:
+            min_ls, max_ls = WIDTH_MIN_LENGTH_SCALE, WIDTH_MAX_LENGTH_SCALE
+        width_gp_fit = gaussian_process_smooth(
+            line_position, target, delta_err, pixel.astype(float), n_restarts=3,
+            min_length_scale=min_ls, max_length_scale=max_ls)
+        proposed_grid = width_gp_fit['z_mean']
+        log_sigma_grid = log_sigma_grid + step_size * (proposed_grid - log_sigma_grid)
+
+    _width_gp_state['calls'] += 1
+    if frozen is None and _width_gp_state['calls'] >= WIDTH_WARMUP_CALLS:
+        _width_gp_state['frozen_length_scale'] = width_gp_fit['length_scale']
+        print(f"  width GP length scale now frozen at {width_gp_fit['length_scale']:.1f} pix")
+
+    return log_sigma_grid, width_gp_fit
 
 
 # =========================================================================
@@ -677,7 +763,7 @@ for iteration in range(N_OUTER_ITERATIONS):
     v_pix = velocity_per_pixel_from_positions(line_position)
 
     shape_coeffs = fit_shape_departure(line_position, width_coeffs, v_pix)
-    width_coeffs = fit_width(shape_coeffs, width_coeffs, line_position, v_pix)
+    width_coeffs, width_gp_fit = fit_width(shape_coeffs, width_coeffs, line_position, v_pix)
     line_position, dispersion_gp_fit = fit_dispersion(width_coeffs, shape_coeffs, line_position)
 
     line_width = width(line_position, width_coeffs)
@@ -700,6 +786,9 @@ v_pix = velocity_per_pixel_from_positions(line_position)
 # line's wavelength -- from the LAST outer iteration's dispersion fit, for
 # plotting an honest uncertainty band rather than just the position itself.
 dispersion_position_std = dispersion_gp_fit['z_std']
+# Same idea for width: the GP's own posterior uncertainty on log(sigma),
+# on the same pixel grid width(x, ...) interpolates against.
+width_log_sigma_std = width_gp_fit['z_std']
 line_width = width(line_position, width_coeffs)
 shape_weight = Chebyshev.chebvander(rescaled_position(line_position), SHAPE_POLY_ORDER)
 departure = shape_weight @ shape_coeffs
@@ -728,6 +817,7 @@ print(f"resolving power R = c / FWHM(v): "
 np.savez(
     'lsf_reconstruction_results.npz',
     u=u, shape_coeffs=shape_coeffs, width_coeffs=width_coeffs,
+    width_log_sigma_std=width_log_sigma_std,
     line_position=line_position, dispersion_position_std=dispersion_position_std,
     line_width=line_width, v_pix=v_pix, shape_poly_order=SHAPE_POLY_ORDER,
     x_min=x_min, x_max=x_max, wavelength=wavelength,

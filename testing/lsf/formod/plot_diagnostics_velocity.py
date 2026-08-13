@@ -38,6 +38,7 @@ results = np.load(RESULTS_FILE)
 u = results['u']                        # km/s
 shape_coeffs = results['shape_coeffs']
 width_coeffs = results['width_coeffs']
+width_log_sigma_std = results['width_log_sigma_std']
 line_position = results['line_position']  # pixels
 dispersion_position_std = results['dispersion_position_std']  # pixels
 wavelength = results['wavelength']  # nm, needed for the dispersion relation panel
@@ -175,12 +176,19 @@ ax.set_title('Normalised residuals, (flux - model) / error')
 ax.set_xlabel('pixel')
 
 # --- dispersion residuals, now with the GP's own uncertainty band --------
+# Plotted against detector position (not line index), with vertical lines
+# at 1/8-detector boundaries: if a pattern lines up with these, that
+# points to a per-amplifier readout effect (many CCDs used in echelle
+# spectrographs are read out through several amplifiers, each covering an
+# equal share of the columns, and small gain/offset mismatches between
+# them show up exactly at these boundaries).
 ax = axes[1, 2]
 ax.errorbar(line_position, line_position - peak_pixel,
             yerr=dispersion_position_std, fmt='.', ms=4, elinewidth=0.5, capsize=0)
 ax.axhline(0, color='gray', lw=0.5)
+[ax.axvline(n_pixels / 8 * i, color='red', lw=0.8) for i in range(9)]
 ax.set_title('Fitted line position minus input peak pixel\n(error bars: GP posterior std)')
-ax.set_xlabel('line index')
+ax.set_xlabel('pixel')
 ax.set_ylabel('pixel')
 
 # --- FWHM(x), now in km/s, with resolving power on a twin axis -----------
@@ -215,15 +223,23 @@ ax.legend(fontsize=8)
 ax.set_title('Shape departure basis functions d_k(u)\n(masked to median data-constrained u)')
 ax.set_xlabel('u [km/s]')
 
-# --- NEW: width polynomial coefficients ----------------------------------
+# --- width sigma(x): now a GP grid with its own uncertainty band ---------
+# Reconstructed the same way width(x, ...) does in lsf_reconstruction_
+# velocity.py: log(sigma) is fit directly on the pixel grid via
+# gaussian_process_smooth, so there are no coefficients to show any more.
 ax = axes[2, 1]
-orders = np.arange(len(width_coeffs))
-ax.bar(orders, width_coeffs, color='tab:blue')
-ax.axhline(0, color='gray', lw=0.5)
-ax.set_xticks(orders)
-ax.set_title('Width sigma(x): Chebyshev coefficients')
-ax.set_xlabel('Chebyshev order k')
-ax.set_ylabel('coefficient [km/s]')
+sigma_grid = np.maximum(np.exp(width_coeffs), 0.05 * np.median(v_pix))
+fwhm_grid = 2.355 * sigma_grid
+fwhm_upper = 2.355 * np.exp(width_coeffs + width_log_sigma_std)
+fwhm_lower = 2.355 * np.exp(width_coeffs - width_log_sigma_std)
+ax.plot(pixel, fwhm_grid, color='tab:blue', lw=1.3)
+ax.fill_between(pixel, fwhm_lower, fwhm_upper, color='tab:blue', alpha=0.3,
+                label='GP posterior std')
+ax.legend(fontsize=8)
+ax.set_xlim(peak_pixel.min() - 50, peak_pixel.max() + 50)
+ax.set_title('Width: FWHM(x) [km/s], from the fitted GP grid')
+ax.set_xlabel('pixel')
+ax.set_ylabel('FWHM [km/s]')
 
 # --- dispersion relation itself: pixel position vs wavelength ------------
 # Dispersion is now a Gaussian Process fit directly to (wavelength,
