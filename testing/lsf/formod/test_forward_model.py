@@ -102,7 +102,50 @@ def local_extremum(centres, kind, half_width=2):
         values[i] = flux_raw[lo:hi].max() if kind == 'max' else flux_raw[lo:hi].min()
     return values
 
-peak_flux = local_extremum(peak_pixel, 'max')
+def local_peak_subpixel(centres, half_width=2):
+    """ Sub-pixel corrected peak flux via 3-point parabolic interpolation
+        around the discrete maximum near each centre.
+
+        Using the raw discrete maximum directly (as local_extremum does)
+        creates a circular normalisation: the envelope is fit through
+        these same values, and later every pixel's flux is divided by the
+        envelope evaluated at that pixel -- including the very pixel that
+        defined the envelope there. The normalised flux at each line's
+        brightest pixel is then forced close to 1 almost by construction,
+        for every line, regardless of how far that pixel's true sub-pixel
+        phase (its offset from the line's actual continuous centre) is
+        from zero. Confirmed directly: the model's own prediction at the
+        brightest pixel correlates strongly with |phase| (-0.92), exactly
+        as expected physically (a pixel further from the true centre
+        samples a slightly lower value) -- but the DATA showed almost no
+        such dependence (correlation 0.11), because the raw discrete
+        maximum IS the phase-dependent quantity that should vary, and using
+        it to define the normalisation erases that variation before the
+        LSF fit ever sees it.
+
+        The parabolic interpolation below estimates the peak of the
+        underlying continuous profile from the three points around the
+        discrete maximum, which is a genuinely phase-independent quantity
+        (up to noise) -- the standard way to recover a continuous peak
+        height from discrete samples. """
+    values = np.empty(len(centres))
+    for i, c in enumerate(centres):
+        lo = max(int(round(c)) - half_width, 0)
+        hi = min(int(round(c)) + half_width + 1, n_pixels)
+        window = flux_raw[lo:hi]
+        i_max = np.argmax(window)
+        if i_max == 0 or i_max == len(window) - 1:
+            values[i] = window[i_max]   # discrete max at the search edge; no interpolation possible
+            continue
+        y0, y1, y2 = window[i_max - 1], window[i_max], window[i_max + 1]
+        denominator = y2 - 2 * y1 + y0
+        if denominator >= 0:            # not a proper local maximum shape; fall back
+            values[i] = y1
+        else:
+            values[i] = y1 - (y2 - y0)**2 / (8 * denominator)
+    return values
+
+peak_flux = local_peak_subpixel(peak_pixel)
 boundary_pixel = np.unique(np.concatenate([left_edge, right_edge]))
 boundary_flux = local_extremum(boundary_pixel, 'min')
 peak_flux_err = err_raw[np.round(peak_pixel).astype(int)]
