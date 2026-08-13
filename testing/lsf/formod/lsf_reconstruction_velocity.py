@@ -44,8 +44,8 @@ from lfc.fitting.gp import gaussian_process_smooth
 SPEED_OF_LIGHT = 2.99792458e8       # m / s
 C_LIGHT_KMS = SPEED_OF_LIGHT / 1e3  # km / s
 
-SPECTRUM_FILE = '/Users/dmilakov/software/harps/lsf/test/example_data_ESPRESSO_od=100.txt'
-LINES_FILE = '/Users/dmilakov/software/harps/lsf/test/line_positions_ESPRESSO_od=100.txt'
+SPECTRUM_FILE = '/Users/dmilakov/software/harps/lsf/test/example_data_ESPRESSO_od=50.txt'
+LINES_FILE = '/Users/dmilakov/software/harps/lsf/test/line_positions_ESPRESSO_od=50.txt'
 
 
 # =========================================================================
@@ -209,9 +209,56 @@ print(f"background(x) = {background_coeffs[0]:.1f} + "
       f"polynomial(degree {BACKGROUND_POLY_ORDER}) * envelope(x), "
       f"coefficients = {np.round(background_coeffs, 6)}")
 
+# ---------------------------------------------------------------------
+# Independent residual term for the background, on top of the coupled
+# c_0 + poly(x)*E(x) term above.
+#
+# The coupled term is kept exactly as before: it is the physically
+# motivated part, encoding the idea that the envelope and background are
+# shaped by much of the same underlying process (here, understood as the
+# LFC's photonic-crystal-fibre dispersion and electronics, which need not
+# affect the peak and inter-line flux identically, but plausibly share a
+# common smooth trend). That physical picture does not require B to be
+# EXACTLY a smooth multiple of E, though -- only that the two are
+# related. Forcing B to be exactly c_0 + poly(x)*E(x), with poly(x) a
+# smooth low-degree gain, means B can only ever be as locally-structured
+# as E itself is: once E was deliberately smoothed (ENVELOPE_MIN_LENGTH_
+# SCALE), B lost the ability to track any genuine local structure of its
+# own, since there was nothing left in E's shape for the gain factor to
+# modulate. This residual term restores that ability directly: it is a
+# SEPARATE GP fit to whatever the coupled term does not explain in the
+# boundary measurements, with its own (much shorter, freely-learned)
+# length scale, uncoupled from the envelope's smoothness entirely.
+BACKGROUND_RESIDUAL_MIN_LENGTH_SCALE = 20  # pixels; modest floor mainly to
+                                             # stop the residual from
+                                             # chasing per-point noise --
+                                             # much shorter than the
+                                             # envelope's own 1000-pixel
+                                             # floor, deliberately, since
+                                             # this term's entire purpose
+                                             # is to capture what the
+                                             # smooth coupled term cannot
+coupled_prediction_at_boundary = background_design_row(
+    boundary_pixel, envelope(boundary_pixel)) @ background_coeffs
+boundary_residual = boundary_flux - coupled_prediction_at_boundary
+
+residual_gp_fit = gaussian_process_smooth(
+    boundary_pixel, boundary_residual, boundary_flux_err, pixel.astype(float),
+    n_restarts=3, min_length_scale=BACKGROUND_RESIDUAL_MIN_LENGTH_SCALE)
+background_residual_grid = residual_gp_fit['z_mean']
+background_residual_std_grid = residual_gp_fit['z_std']
+print(f"  background residual: GP length scale = {residual_gp_fit['length_scale']:.1f} pix, "
+      f"signal std = {residual_gp_fit['signal_std']:.1f}")
+
+def background_residual(x):
+    return np.interp(x, pixel.astype(float), background_residual_grid)
+
+def background_residual_std(x):
+    return np.interp(x, pixel.astype(float), background_residual_std_grid)
+
 def background(x):
     e = envelope(x)
-    return background_design_row(x, e) @ background_coeffs
+    return background_design_row(x, e) @ background_coeffs + background_residual(x)
 
 envelope_grid_full = envelope(pixel.astype(float))
 background_grid_full = background(pixel.astype(float))
@@ -248,10 +295,15 @@ sigma_E = envelope_std(pixel.astype(float))
 design_row_full = background_design_row(pixel.astype(float), envelope_grid_full)
 coeff_variance_term = np.einsum('ij,jk,ik->i', design_row_full,
                                  background_coeffs_covariance, design_row_full)
+# The residual term d_B(x) added above contributes its own, independent
+# uncertainty to B: it enters additively (dB/d(d_B) = 1) and is fit
+# separately from E and the coupled coefficients, so its variance simply
+# adds on top of the two terms already accounted for below.
+residual_variance_term = background_residual_std(pixel.astype(float))**2
 
-var_D = (1 - poly_gain)**2 * sigma_E**2 + coeff_variance_term
-var_N = err_raw**2 + poly_gain**2 * sigma_E**2 + coeff_variance_term
-cov_ND = poly_gain * (poly_gain - 1) * sigma_E**2 + coeff_variance_term
+var_D = (1 - poly_gain)**2 * sigma_E**2 + coeff_variance_term + residual_variance_term
+var_N = err_raw**2 + poly_gain**2 * sigma_E**2 + coeff_variance_term + residual_variance_term
+cov_ND = poly_gain * (poly_gain - 1) * sigma_E**2 + coeff_variance_term + residual_variance_term
 
 N_full = flux_raw - background_grid_full
 D_full = envelope_grid_full - background_grid_full
@@ -262,37 +314,58 @@ inverse_variance = 1.0 / flux_err**2
 
 
 # =========================================================================
-# 3. Wavelength calibration model -- ITS MATHEMATICAL FORM ONLY, defined
-#    here (ahead of the LSF model) because converting a pixel offset to a
-#    velocity offset needs the dispersion solution's own derivative. The
-#    actual FITTING of its coefficients (Gauss-Newton, ridge band) is
-#    still in section 6, in its usual place in the processing order.
+# 3. Wavelength calibration model
 # =========================================================================
-#   x(lambda) = sum_{k=0}^{P} xi_k * T_k(lambda~)
+# x(lambda) is represented directly by its value at the M known comb
+# wavelengths, line_position, fit via gp.py's gaussian_process_smooth --
+# not a polynomial, and not a custom kernel. This reuses the SAME utility
+# already used for the envelope and background above, rather than
+# building separate GP machinery just for this.
 #
-#   - degrees 0 .. DISPERSION_FREE_ORDER: an unconstrained smooth trend.
-#   - degrees DISPERSION_FREE_ORDER+1 .. DISPERSION_TOTAL_ORDER: a "local
-#     perturbation" band, ridge-penalised to a stated RMS scale.
-
-DISPERSION_TOTAL_ORDER = 25
-DISPERSION_FREE_ORDER = 4
-DISPERSION_LOCAL_SCALE = 0.15  # pixels, RMS
+# gaussian_process_smooth needs (x, z, z_err) triples: here x=wavelength,
+# z=pixel position. Position enters the pixel-level forward model
+# NONLINEARLY (through the convolution), so those (position, uncertainty)
+# values are not directly observed -- they come from linearising the
+# model around the current position estimate at each outer iteration
+# (the same Gauss-Newton idea used elsewhere in this script), reducing
+# each line's own pixel window to a single scalar correction with a
+# formal uncertainty, then letting the GP smooth those corrections across
+# wavelength. This is standard practice in real wavelength-calibration
+# pipelines (per-line centroid, then a global smooth fit through them);
+# what keeps it consistent with "position is determined by wavelength,
+# not independently observable" is that it is a refinement step repeated
+# inside an iteration, not a one-shot measurement taken as ground truth.
+#
+# No custom kernel or inducing-point scheme is needed here (unlike an
+# earlier version of this project's LSF-shape GP, which did need one): a
+# dense fit over ~400 points is exactly what gaussian_process_smooth
+# already does successfully for the envelope and background above, at a
+# similar number of points, without the ill-conditioning that motivated
+# inducing points elsewhere.
+#
+# velocity_per_pixel needs a LOCAL DERIVATIVE of x(lambda), which would
+# otherwise mean re-running the whole GP fit (sigma-clipping, multi-
+# restart hyperparameter search) for every tiny perturbation -- far too
+# slow. Computed instead directly from the already-fitted (wavelength,
+# line_position) pairs via a discrete derivative across neighbouring
+# lines, avoiding any need to evaluate the GP off-grid at all.
 
 lambda_min, lambda_max = wavelength.min(), wavelength.max()
+lambda_span = lambda_max - lambda_min
+_wavelength_order = np.argsort(wavelength)
 
-def rescaled_wavelength(lam):
-    return 2 * (lam - lambda_min) / (lambda_max - lambda_min) - 1
-
-def dispersion_design_matrix(lam, order=DISPERSION_TOTAL_ORDER):
-    return Chebyshev.chebvander(rescaled_wavelength(lam), order)
-
-def x_of_lambda(lam, coeffs):
-    """ The dispersion solution's mathematical form, x(lambda; coeffs),
-        callable at any wavelength(s) -- used both by the fitting routine
-        in section 6 and by the velocity-per-pixel conversion in section 4. """
-    return dispersion_design_matrix(lam) @ coeffs
-
-dispersion_basis = dispersion_design_matrix(wavelength)  # at the KNOWN comb wavelengths
+def velocity_per_pixel_from_positions(position):
+    """ Local km/s-per-pixel scale at every comb line's own wavelength,
+        from the CURRENT position array, via a discrete derivative across
+        neighbouring lines (sorted by wavelength) -- not fit, computed
+        directly from whatever the current best position estimate is. """
+    lam_sorted = wavelength[_wavelength_order]
+    pos_sorted = position[_wavelength_order]
+    dx_dlambda_sorted = np.gradient(pos_sorted, lam_sorted)
+    v_pix_sorted = C_LIGHT_KMS / dx_dlambda_sorted / lam_sorted
+    v_pix = np.empty_like(v_pix_sorted)
+    v_pix[_wavelength_order] = v_pix_sorted
+    return v_pix
 
 
 # =========================================================================
@@ -318,20 +391,10 @@ dispersion_basis = dispersion_design_matrix(wavelength)  # at the KNOWN comb wav
 # grid u, with the Jacobian factor du/v_pix appearing in the discretised
 # weights below.
 
-def velocity_per_pixel(lam, coeffs, finite_difference_step=1e-4):
-    """ Local km/s-per-pixel scale at wavelength(s) lam, from the CURRENT
-        dispersion solution x(lambda; coeffs) -- not fit, evaluated
-        directly via v_pix = c * (dlambda/dx) / lambda, using
-        dlambda/dx = 1 / (dx/dlambda) and a finite-difference derivative
-        of x_of_lambda. """
-    dx_dlambda = (x_of_lambda(lam + finite_difference_step, coeffs) -
-                  x_of_lambda(lam - finite_difference_step, coeffs)) / (2 * finite_difference_step)
-    return C_LIGHT_KMS / dx_dlambda / lam
-
 # A representative, ORDER-AVERAGED velocity-per-pixel scale, used only to
 # set a sensible grid range and resolution below -- the actual forward
-# model always uses each line's own local value (velocity_per_pixel above,
-# evaluated from whatever the current dispersion solution is).
+# model always uses each line's own local value (velocity_per_pixel_from_
+# positions above, evaluated from the current position estimate).
 _v_per_pixel_typical = (C_LIGHT_KMS * (lambda_max - lambda_min)
                          / (x_max - x_min) / np.mean(wavelength))
 print(f"typical velocity scale: {_v_per_pixel_typical:.4f} km/s per pixel")
@@ -404,44 +467,50 @@ width_coeffs = np.linalg.lstsq(width_design_matrix(peak_pixel),
 
 
 # =========================================================================
-# 6. Wavelength calibration: fitting the coefficients
+# 6. Wavelength calibration: fitting the position at each comb line
 # =========================================================================
-# Because pixel position enters the forward model nonlinearly, the
-# coefficients are fit by Gauss-Newton iteration: linearise the model
-# around the current dispersion solution, solve the resulting (linear,
-# ridge-regularised) weighted least-squares problem for an updated
-# coefficient vector, and repeat a few times as the solution shifts. The
-# local velocity-per-pixel scale (needed to build every convolution
-# matrix) is recomputed from the CURRENT coefficients once per Gauss-
-# Newton step, then held fixed for that step's own linearisation --
-# consistent with how every other quantity here is frozen during a single
-# linearisation step.
+# Because pixel position enters the forward model nonlinearly, this is
+# still an iterative (Gauss-Newton-like) refinement: linearise the model
+# around each line's current position, solve the resulting 1-parameter
+# weighted least-squares problem for a local correction with a formal
+# uncertainty, then let gaussian_process_smooth fit a smooth curve through
+# (wavelength, position + correction, uncertainty) -- exactly the same
+# tool already used for the envelope and background, reused here rather
+# than building separate GP machinery.
+#
+# The naive (photon-noise-only) uncertainty on each line's local
+# correction is inflated by sqrt(chi2/dof) from that line's own fit before
+# being handed to the GP: confirmed directly in an earlier version of this
+# project that the raw uncertainty badly underestimates the true scatter
+# (it only accounts for noise at fixed width/shape, not any of the
+# model's own uncertainty or genuine line-to-line mismatch), and feeding
+# that underestimate to a smoother makes it trust noise as if it were
+# signal.
 
-n_local_band = DISPERSION_TOTAL_ORDER - DISPERSION_FREE_ORDER
-dispersion_ridge = np.zeros(DISPERSION_TOTAL_ORDER + 1)
-dispersion_ridge[DISPERSION_FREE_ORDER + 1:] = n_local_band / DISPERSION_LOCAL_SCALE**2
-dispersion_ridge_precision = np.diag(dispersion_ridge)
+DISPERSION_MIN_LENGTH_SCALE = None  # nm; set a floor here if the fitted
+                                       # dispersion relation looks too
+                                       # wiggly, the same way
+                                       # ENVELOPE_MIN_LENGTH_SCALE controls
+                                       # the envelope's smoothness
+DISPERSION_MAX_LENGTH_SCALE = None  # nm; None uses gaussian_process_smooth's
+                                       # own default (roughly 2.7x the
+                                       # wavelength span), generous enough
+                                       # to capture the whole dispersion
+                                       # trend if the data support it
 
-print(f"dispersion relation: degrees 0-{DISPERSION_FREE_ORDER} unconstrained, "
-      f"degrees {DISPERSION_FREE_ORDER + 1}-{DISPERSION_TOTAL_ORDER} constrained to "
-      f"~{DISPERSION_LOCAL_SCALE} pix RMS")
-
-def fit_dispersion(width_coeffs, shape_coeffs, dispersion_coeffs,
-                    n_gauss_newton_steps=4, step_size=0.5,
-                    finite_difference_step=1e-3):
-    coeffs = dispersion_coeffs.copy()
-    for _ in range(n_gauss_newton_steps):
-        line_position = x_of_lambda(wavelength, coeffs)
-        v_pix = velocity_per_pixel(wavelength, coeffs)
+def fit_dispersion(width_coeffs, shape_coeffs, line_position_init,
+                    n_outer_steps=4, step_size=0.5, finite_difference_step=1e-3):
+    line_position = line_position_init.copy()
+    dispersion_gp_fit = None
+    for _ in range(n_outer_steps):
+        v_pix = velocity_per_pixel_from_positions(line_position)
         line_width = width(line_position, width_coeffs)
         shape_weight = Chebyshev.chebvander(rescaled_position(line_position),
                                              shape_coeffs.shape[0] - 1)
         departure = shape_weight @ shape_coeffs
 
-        n_dim = DISPERSION_TOTAL_ORDER + 1
-        normal_matrix = dispersion_ridge_precision.copy()
-        normal_vector = np.zeros(n_dim)
-
+        delta = np.zeros(n_lines)
+        delta_err = np.zeros(n_lines)
         for m in range(n_lines):
             idx = fit_window(line_position[m])
             conv = convolution_matrix(line_position[m], idx, v_pix[m])
@@ -453,16 +522,27 @@ def fit_dispersion(width_coeffs, shape_coeffs, dispersion_coeffs,
             model_derivative = (conv_shifted @ lsf - model_value) / finite_difference_step
 
             weight = inverse_variance[idx]
-            row = dispersion_basis[m][None, :] * model_derivative[:, None]
-            target = flux[idx] - model_value + model_derivative * line_position[m]
+            denominator = np.sum(model_derivative**2 * weight)
+            if denominator > 1e-12:
+                delta[m] = np.sum(model_derivative * weight * (flux[idx] - model_value)) / denominator
+                naive_err = 1.0 / np.sqrt(denominator)
+                residual = (model_value + model_derivative * delta[m] - flux[idx]) / flux_err[idx]
+                dof = max(len(idx) - 1, 1)
+                chi2_reduced = np.sum(residual**2) / dof
+                delta_err[m] = naive_err * np.sqrt(max(chi2_reduced, 1.0))
+            else:
+                delta[m] = 0.0
+                delta_err[m] = np.inf
 
-            normal_matrix += (row * weight[:, None]).T @ row
-            normal_vector += (row * weight[:, None]).T @ target
+        target = line_position + delta
+        dispersion_gp_fit = gaussian_process_smooth(
+            wavelength, target, delta_err, wavelength, n_restarts=3,
+            min_length_scale=DISPERSION_MIN_LENGTH_SCALE,
+            max_length_scale=DISPERSION_MAX_LENGTH_SCALE)
+        proposed = dispersion_gp_fit['z_mean']
+        line_position = line_position + step_size * (proposed - line_position)
 
-        proposed = np.linalg.solve(normal_matrix, normal_vector)
-        coeffs = coeffs + step_size * (proposed - coeffs)
-
-    return x_of_lambda(wavelength, coeffs), coeffs
+    return line_position, dispersion_gp_fit
 
 
 # =========================================================================
@@ -586,36 +666,40 @@ def fit_width(shape_coeffs, width_coeffs_initial, line_position, v_pix):
 # =========================================================================
 # 8. Joint iterative solution
 # =========================================================================
-initial_dispersion_coeffs = np.linalg.lstsq(dispersion_basis, peak_pixel, rcond=None)[0]
-line_position = x_of_lambda(wavelength, initial_dispersion_coeffs)
-dispersion_coeffs = initial_dispersion_coeffs
+line_position = peak_pixel.copy()  # bootstrap: start from the input LFC
+                                     # line-list positions; refined below
 shape_coeffs = np.zeros((SHAPE_POLY_ORDER + 1, n_grid))
+dispersion_gp_fit = None
 
 N_OUTER_ITERATIONS = 6
 
 for iteration in range(N_OUTER_ITERATIONS):
-    v_pix = velocity_per_pixel(wavelength, dispersion_coeffs)
+    v_pix = velocity_per_pixel_from_positions(line_position)
 
     shape_coeffs = fit_shape_departure(line_position, width_coeffs, v_pix)
     width_coeffs = fit_width(shape_coeffs, width_coeffs, line_position, v_pix)
-    line_position, dispersion_coeffs = fit_dispersion(width_coeffs, shape_coeffs,
-                                                        dispersion_coeffs)
+    line_position, dispersion_gp_fit = fit_dispersion(width_coeffs, shape_coeffs, line_position)
 
     line_width = width(line_position, width_coeffs)
-    v_pix = velocity_per_pixel(wavelength, dispersion_coeffs)
+    v_pix = velocity_per_pixel_from_positions(line_position)
     line_width_pix = line_width / v_pix   # for cross-checking against pixel-space intuition
     position_change = np.sqrt(np.mean((line_position - peak_pixel)**2))
     print(f"iteration {iteration}: "
           f"|position - input| (rms) = {position_change:.4f} pix, "
           f"sigma(v) in [{line_width.min():.4f}, {line_width.max():.4f}] km/s, "
           f"FWHM in [{2.355 * line_width.min():.3f}, {2.355 * line_width.max():.3f}] km/s "
-          f"(~[{2.355 * line_width_pix.min():.2f}, {2.355 * line_width_pix.max():.2f}] pix)")
+          f"(~[{2.355 * line_width_pix.min():.2f}, {2.355 * line_width_pix.max():.2f}] pix), "
+          f"dispersion GP length scale = {dispersion_gp_fit['length_scale']:.3f} nm")
 
 
 # =========================================================================
 # 9. Diagnostics
 # =========================================================================
-v_pix = velocity_per_pixel(wavelength, dispersion_coeffs)
+v_pix = velocity_per_pixel_from_positions(line_position)
+# The GP's own posterior uncertainty on the fitted position, at each comb
+# line's wavelength -- from the LAST outer iteration's dispersion fit, for
+# plotting an honest uncertainty band rather than just the position itself.
+dispersion_position_std = dispersion_gp_fit['z_std']
 line_width = width(line_position, width_coeffs)
 shape_weight = Chebyshev.chebvander(rescaled_position(line_position), SHAPE_POLY_ORDER)
 departure = shape_weight @ shape_coeffs
@@ -644,7 +728,7 @@ print(f"resolving power R = c / FWHM(v): "
 np.savez(
     'lsf_reconstruction_results.npz',
     u=u, shape_coeffs=shape_coeffs, width_coeffs=width_coeffs,
-    dispersion_coeffs=dispersion_coeffs, line_position=line_position,
+    line_position=line_position, dispersion_position_std=dispersion_position_std,
     line_width=line_width, v_pix=v_pix, shape_poly_order=SHAPE_POLY_ORDER,
     x_min=x_min, x_max=x_max, wavelength=wavelength,
     flux=flux, flux_err=flux_err, model=model, fitted_mask=fitted_mask, pixel=pixel,

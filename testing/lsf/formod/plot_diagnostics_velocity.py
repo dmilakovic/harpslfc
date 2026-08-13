@@ -38,8 +38,9 @@ results = np.load(RESULTS_FILE)
 u = results['u']                        # km/s
 shape_coeffs = results['shape_coeffs']
 width_coeffs = results['width_coeffs']
-dispersion_coeffs = results['dispersion_coeffs']
 line_position = results['line_position']  # pixels
+dispersion_position_std = results['dispersion_position_std']  # pixels
+wavelength = results['wavelength']  # nm, needed for the dispersion relation panel
 line_width = results['line_width']        # km/s
 v_pix = results['v_pix']                  # km/s per pixel, per line
 shape_poly_order = int(results['shape_poly_order'])
@@ -173,10 +174,12 @@ ax.set_ylim(-30, 30)
 ax.set_title('Normalised residuals, (flux - model) / error')
 ax.set_xlabel('pixel')
 
-# --- dispersion residuals (pixel space, unaffected) -----------------------
+# --- dispersion residuals, now with the GP's own uncertainty band --------
 ax = axes[1, 2]
-ax.plot(np.arange(len(line_position)), line_position - peak_pixel, '.')
-ax.set_title('Fitted line position minus input peak pixel')
+ax.errorbar(line_position, line_position - peak_pixel,
+            yerr=dispersion_position_std, fmt='.', ms=4, elinewidth=0.5, capsize=0)
+ax.axhline(0, color='gray', lw=0.5)
+ax.set_title('Fitted line position minus input peak pixel\n(error bars: GP posterior std)')
 ax.set_xlabel('line index')
 ax.set_ylabel('pixel')
 
@@ -222,15 +225,23 @@ ax.set_title('Width sigma(x): Chebyshev coefficients')
 ax.set_xlabel('Chebyshev order k')
 ax.set_ylabel('coefficient [km/s]')
 
-# --- NEW: dispersion polynomial coefficients ------------------------------
+# --- dispersion relation itself: pixel position vs wavelength ------------
+# Dispersion is now a Gaussian Process fit directly to (wavelength,
+# position) -- see lsf_reconstruction_velocity.py -- so there are no
+# polynomial coefficients to show any more; the natural replacement is the
+# relation itself, with its GP uncertainty band.
 ax = axes[2, 2]
-orders = np.arange(len(dispersion_coeffs))
-ax.bar(orders, dispersion_coeffs, color='tab:green')
-ax.axhline(0, color='gray', lw=0.5)
-ax.set_yscale('symlog', linthresh=1e-2)
-ax.set_title('Dispersion x(lambda): Chebyshev coefficients\n(symlog scale)')
-ax.set_xlabel('Chebyshev order k')
-ax.set_ylabel('coefficient [pixels]')
+wavelength_order = np.argsort(wavelength)
+lam_sorted = wavelength[wavelength_order]
+pos_sorted = line_position[wavelength_order]
+std_sorted = dispersion_position_std[wavelength_order]
+ax.plot(lam_sorted, pos_sorted, '-', color='tab:green', lw=1)
+ax.fill_between(lam_sorted, pos_sorted - std_sorted, pos_sorted + std_sorted,
+                color='tab:green', alpha=0.3, label='GP posterior std')
+ax.legend(fontsize=8)
+ax.set_title('Dispersion relation: x(lambda)')
+ax.set_xlabel('wavelength [nm]')
+ax.set_ylabel('pixel')
 
 axes[2, 3].axis('off')
 
