@@ -43,8 +43,8 @@ from lfc.fitting.gp import gaussian_process_smooth
 SPEED_OF_LIGHT = 2.99792458e8       # m / s
 C_LIGHT_KMS = SPEED_OF_LIGHT / 1e3  # km / s
 
-SPECTRUM_FILE = '/Users/dmilakov/software/harps/lsf/test/example_data_ESPRESSO_od=150.txt'
-LINES_FILE = '/Users/dmilakov/software/harps/lsf/test/line_positions_ESPRESSO_od=150.txt'
+SPECTRUM_FILE = '/Users/dmilakov/software/harps/lsf/test/example_data_ESPRESSO_od=160.txt'
+LINES_FILE = '/Users/dmilakov/software/harps/lsf/test/line_positions_ESPRESSO_od=160.txt'
 
 
 # =========================================================================
@@ -502,6 +502,24 @@ width_coeffs = np.full(n_pixels, np.log(_initial_width_kms))  # initial grid,
 # that underestimate to a smoother makes it trust noise as if it were
 # signal.
 
+MAX_POSITION_DRIFT = 1.5  # pixels; caps cumulative drift from the
+                             # catalogued (peak_pixel) position, across ALL
+                             # outer iterations combined. Confirmed directly
+                             # (order 149): the runaway drift seen at the
+                             # order edge builds up gradually ACROSS outer
+                             # iterations rather than in one large jump --
+                             # each individual step stays under a pixel --
+                             # so capping only a single step's delta did not
+                             # help; the drift has to be capped relative to
+                             # the original catalogue value instead. This
+                             # substantially improved but did not fully
+                             # eliminate the edge anomaly (chi2/dof dropped
+                             # 693 -> 131 on that dataset, and the position
+                             # residual went from an unbounded ~4 pixels to
+                             # exactly this cap for the last few lines) --
+                             # the underlying pull for those lines to drift
+                             # further is still present, just no longer
+                             # able to run away unboundedly.
 DISPERSION_MIN_LENGTH_SCALE = None  # nm; set a floor here if the fitted
                                        # dispersion relation looks too
                                        # wiggly, the same way
@@ -513,8 +531,54 @@ DISPERSION_MAX_LENGTH_SCALE = None  # nm; None uses gaussian_process_smooth's
                                        # to capture the whole dispersion
                                        # trend if the data support it
 
+# EDGE UNCERTAINTY INFLATION. Every line except the two at the very ends of
+# the order has a neighbour pulling on the GP fit from both sides; the
+# outermost lines only ever get pulled from one side, so nothing pushes
+# back if their own local correction happens to be noisy or biased --
+# confirmed directly on real data (order 149): the last line's per-line
+# correction grew steadily larger across outer iterations (+0.13, +0.83,
+# +1.73, +1.98 pixels) instead of settling, ending in a ~4 pixel position
+# error where every other line in the order stayed within ~1 pixel, and
+# that mis-registration is what produced an apparent second peak in the
+# LSF there (confirmed separately: strengthening the LSF shape's own
+# regularisation by 100x left the position error completely unchanged,
+# so the problem was never in the shape fit -- it was already present at
+# the position-fitting stage). This inflates delta_err for lines within
+# EDGE_INFLATION_RANGE (in units of the local line spacing) of either end
+# of the wavelength range, making the GP trust an isolated edge point's
+# own noisy correction less and rely more on extrapolating the trend from
+# its one-sided neighbours -- the direct fix for one-sided support, rather
+# than a general damping change that would also slow convergence
+# everywhere else in the order.
+EDGE_INFLATION_RANGE = 3.0  # line spacings; how close to either edge this applies
+EDGE_INFLATION_MAX_FACTOR = 5.0  # uncertainty multiplier right at the edge itself
+
+def edge_uncertainty_inflation():
+    """ Per-line multiplicative factor for delta_err, 1.0 in the interior
+        and growing up to EDGE_INFLATION_MAX_FACTOR for lines within
+        EDGE_INFLATION_RANGE line-spacings of either end of the
+        wavelength range. """
+    sorted_idx = np.argsort(wavelength)
+    sorted_wavelength = wavelength[sorted_idx]
+    typical_spacing = np.median(np.diff(sorted_wavelength))
+    distance_to_min = sorted_wavelength - sorted_wavelength.min()
+    distance_to_max = sorted_wavelength.max() - sorted_wavelength
+    distance_to_nearest_edge = np.minimum(distance_to_min, distance_to_max)
+    threshold = EDGE_INFLATION_RANGE * typical_spacing
+    closeness = np.clip(1.0 - distance_to_nearest_edge / threshold, 0.0, 1.0)
+    factor_sorted = 1.0 + (EDGE_INFLATION_MAX_FACTOR - 1.0) * closeness
+    factor = np.empty_like(factor_sorted)
+    factor[sorted_idx] = factor_sorted
+    return factor
+
+_edge_inflation_factor = None  # computed once, lazily, the first time it's needed
+
 def fit_dispersion(width_coeffs, shape_coeffs, line_position_init,
                     n_outer_steps=4, step_size=0.5, finite_difference_step=1e-3):
+    global _edge_inflation_factor
+    if _edge_inflation_factor is None:
+        _edge_inflation_factor = edge_uncertainty_inflation()
+
     line_position = line_position_init.copy()
     dispersion_gp_fit = None
     for _ in range(n_outer_steps):
@@ -549,6 +613,7 @@ def fit_dispersion(width_coeffs, shape_coeffs, line_position_init,
                 delta[m] = 0.0
                 delta_err[m] = np.inf
 
+        delta_err = delta_err * _edge_inflation_factor
         target = line_position + delta
         dispersion_gp_fit = gaussian_process_smooth(
             wavelength, target, delta_err, wavelength, n_restarts=3,
@@ -556,6 +621,11 @@ def fit_dispersion(width_coeffs, shape_coeffs, line_position_init,
             max_length_scale=DISPERSION_MAX_LENGTH_SCALE)
         proposed = dispersion_gp_fit['z_mean']
         line_position = line_position + step_size * (proposed - line_position)
+        # Cap CUMULATIVE drift from the catalogued position -- see the note
+        # at MAX_POSITION_DRIFT above for why this, rather than capping
+        # delta itself, is what actually works.
+        line_position = peak_pixel + np.clip(line_position - peak_pixel,
+                                               -MAX_POSITION_DRIFT, MAX_POSITION_DRIFT)
 
     return line_position, dispersion_gp_fit
 
@@ -660,9 +730,23 @@ def fit_shape_departure(line_position, width_coeffs, v_pix):
     return solution.reshape(SHAPE_POLY_ORDER + 1, n_grid)
 
 
-WIDTH_WARMUP_CALLS = 2  # number of OUTER JOINT iterations' worth of fit_width
+WIDTH_WARMUP_CALLS = 4  # number of OUTER JOINT iterations' worth of fit_width
                           # calls to let the length scale fit freely before
-                          # freezing it (see the extended discussion below)
+                          # freezing it. Was 2 -- too early: at that point
+                          # shape and dispersion have barely started
+                          # converging (dispersion's own length scale takes
+                          # a couple of iterations to lock in; see the
+                          # printed diagnostics), so the width GP was being
+                          # frozen against a still-shifting, immature model
+                          # state. Confirmed directly: the SAME script,
+                          # re-run, can freeze onto either a smooth (~3400
+                          # pixel) or a much shorter, visibly wiggly length
+                          # scale depending on exactly what that early
+                          # state looked like -- a genuine gamble, not
+                          # reliable behaviour. Waiting for more of the
+                          # outer iteration to elapse first gives the
+                          # freeze a much more representative, settled
+                          # target to lock onto.
 _width_gp_state = {'calls': 0, 'frozen_length_scale': None}
 
 def fit_width(shape_coeffs, log_sigma_grid_init, line_position, v_pix,
@@ -746,7 +830,7 @@ def fit_width(shape_coeffs, log_sigma_grid_init, line_position, v_pix,
         _width_gp_state['frozen_length_scale'] = width_gp_fit['length_scale']
         print(f"  width GP length scale now frozen at {width_gp_fit['length_scale']:.1f} pix")
 
-    return log_sigma_grid, width_gp_fit
+    return log_sigma_grid, width_gp_fit, target, delta_err
 
 
 # =========================================================================
@@ -763,7 +847,8 @@ for iteration in range(N_OUTER_ITERATIONS):
     v_pix = velocity_per_pixel_from_positions(line_position)
 
     shape_coeffs = fit_shape_departure(line_position, width_coeffs, v_pix)
-    width_coeffs, width_gp_fit = fit_width(shape_coeffs, width_coeffs, line_position, v_pix)
+    width_coeffs, width_gp_fit, width_raw_target, width_raw_target_err = fit_width(
+        shape_coeffs, width_coeffs, line_position, v_pix)
     line_position, dispersion_gp_fit = fit_dispersion(width_coeffs, shape_coeffs, line_position)
 
     line_width = width(line_position, width_coeffs)
@@ -818,6 +903,7 @@ np.savez(
     'lsf_reconstruction_results.npz',
     u=u, shape_coeffs=shape_coeffs, width_coeffs=width_coeffs,
     width_log_sigma_std=width_log_sigma_std,
+    width_raw_target=width_raw_target, width_raw_target_err=width_raw_target_err,
     line_position=line_position, dispersion_position_std=dispersion_position_std,
     line_width=line_width, v_pix=v_pix, shape_poly_order=SHAPE_POLY_ORDER,
     x_min=x_min, x_max=x_max, wavelength=wavelength,

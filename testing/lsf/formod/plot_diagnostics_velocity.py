@@ -6,22 +6,24 @@ lsf_reconstruction_results.npz in the same directory.
 The LSF's own axis (u) is velocity (km/s), not pixels -- see
 lsf_reconstruction_velocity.py for the conversion. Position along the
 order (x) is still naturally described in pixels/wavelength, so panels
-about WHERE ALONG THE ORDER something is (envelope/background, FWHM vs
-position, dispersion residuals) stay in pixel units; panels about the
-LSF's OWN shape (the LSF itself, its departure from Gaussian, the stacked
-per-line data) are in km/s.
+about WHERE ALONG THE ORDER something is (envelope/background, width,
+dispersion) stay in pixel units; panels about the LSF's OWN shape (the
+LSF itself, its departure from Gaussian, the stacked per-line data) are
+in km/s.
 
 DATA-CONSTRAINED MASKING. The native u grid is built wider than any single
-line's fitting window actually reaches (deliberately, in
-lsf_reconstruction_velocity.py -- it has to cover every line, including
-where the local km/s-per-pixel scale v_pix is larger than typical). This
-means the full grid extends into a region where few or no lines' data
-constrain the fit at all, and the fitted curve there is governed by the GP
-prior, not by the data -- exactly what produced the upturn artefacts at the
-grid edges in earlier versions of this plot. Every curve below is now
-masked to only the region within +/- HALF_WINDOW pixels (converted to
-velocity via the LOCAL v_pix relevant to that curve) of wherever it is
-being evaluated.
+line's fitting window actually reaches (deliberately -- it has to cover
+every line, including where the local km/s-per-pixel scale v_pix is
+larger than typical). This means the full grid extends into a region
+where few or no lines' data constrain the fit at all, and the fitted
+curve there is governed by the GP prior, not by the data. Every u-space
+curve below is masked to only the region within +/- HALF_WINDOW pixels
+(converted to velocity via the LOCAL v_pix relevant to that curve) of
+wherever it is being evaluated.
+
+PANELS ARE GROUPED BY TYPE, in this order: envelope/background,
+LSF shape (u-space), width (x-space), dispersion (wavelength-space),
+overall fit diagnostics.
 """
 
 import numpy as np
@@ -39,6 +41,8 @@ u = results['u']                        # km/s
 shape_coeffs = results['shape_coeffs']
 width_coeffs = results['width_coeffs']
 width_log_sigma_std = results['width_log_sigma_std']
+width_raw_target = results['width_raw_target']          # log(sigma), pre-GP
+width_raw_target_err = results['width_raw_target_err']  # its uncertainty
 line_position = results['line_position']  # pixels
 dispersion_position_std = results['dispersion_position_std']  # pixels
 wavelength = results['wavelength']  # nm, needed for the dispersion relation panel
@@ -97,7 +101,9 @@ _colours = _cmap(_norm(_x_pos_array))
 
 fig, axes = plt.subplots(3, 4, figsize=(20, 12))
 
-# --- envelope / background (pixel space -- unaffected by the velocity change)
+# =========================================================================
+# Envelope / background
+# =========================================================================
 ax = axes[0, 0]
 ax.plot(pixel, flux_raw, lw=0.5, color='0.6', label='raw flux')
 ax.plot(pixel, envelope_grid_full, 'r-', lw=1, label='envelope E(x)')
@@ -110,7 +116,9 @@ ax.legend(fontsize=8)
 ax.set_title('Envelope and background')
 ax.set_xlabel('pixel')
 
-# --- LSF shape at 16 positions across the order, masked to data range ----
+# =========================================================================
+# LSF shape (u-space): LSF vs Gaussian, departure, all-lines, basis funcs
+# =========================================================================
 ax = axes[0, 1]
 for x_pos, colour in zip(_x_pos_array, _colours):
     weight = Chebyshev.chebvander(rescaled_position(np.array([x_pos])), shape_poly_order)[0]
@@ -124,7 +132,6 @@ ax.legend(fontsize=6, ncol=1)
 ax.set_title('LSF (solid) vs. Gaussian component (dotted)\nmasked to data-constrained u')
 ax.set_xlabel('u [km/s]')
 
-# --- departure from Gaussianity, masked to data range ----------------------
 ax = axes[0, 2]
 for x_pos, colour in zip(_x_pos_array, _colours):
     weight = Chebyshev.chebvander(rescaled_position(np.array([x_pos])), shape_poly_order)[0]
@@ -135,19 +142,7 @@ ax.axhline(0, color='gray', lw=0.5)
 ax.set_title('Departure from Gaussian: phi(u) - Gaussian(u)\nmasked to data-constrained u')
 ax.set_xlabel('u [km/s]')
 
-# --- example single-line fit (still pixel space: this IS the detector) ---
 ax = axes[0, 3]
-m = len(line_position) // 2
-i0, i1 = int(line_position[m]) - 8, int(line_position[m]) + 9
-idx = np.arange(i0, i1)
-ax.errorbar(idx, flux[idx], yerr=flux_err[idx], fmt='o', ms=3, label='data (normalised)')
-ax.plot(idx, model[idx], 'r-', label='model')
-ax.legend(fontsize=8)
-ax.set_title(f'Example line, FWHM = {2.355 * np.interp(line_position[m], line_position, line_width):.3f} km/s')
-ax.set_xlabel('pixel')
-
-# --- all lines, in velocity space, + oversampled model, masked -----------
-ax = axes[1, 0]
 for m in range(len(line_position)):
     idx = fit_window(line_position[m])
     u_data = (idx - line_position[m]) * v_pix[m]   # pixel offset -> km/s
@@ -166,46 +161,7 @@ ax.set_ylim(-0.3, 1.3)
 ax.set_title('All lines (points) + oversampled LSF model (lines)\nmodel masked to data-constrained u')
 ax.set_xlabel('u = (pixel - fitted line centre) x v_pix [km/s]')
 
-# --- residuals (pixel space, unaffected) ---------------------------------
-ax = axes[1, 1]
-residual = (flux - model) / flux_err
-ax.plot(pixel[fitted_mask], residual[fitted_mask], '.', ms=2, alpha=0.4)
-ax.axhline(0, color='r', lw=0.8)
-ax.set_ylim(-30, 30)
-ax.set_title('Normalised residuals, (flux - model) / error')
-ax.set_xlabel('pixel')
-
-# --- dispersion residuals, now with the GP's own uncertainty band --------
-# Plotted against detector position (not line index), with vertical lines
-# at 1/8-detector boundaries: if a pattern lines up with these, that
-# points to a per-amplifier readout effect (many CCDs used in echelle
-# spectrographs are read out through several amplifiers, each covering an
-# equal share of the columns, and small gain/offset mismatches between
-# them show up exactly at these boundaries).
-ax = axes[1, 2]
-ax.errorbar(line_position, line_position - peak_pixel,
-            yerr=dispersion_position_std, fmt='.', ms=4, elinewidth=0.5, capsize=0)
-ax.axhline(0, color='gray', lw=0.5)
-[ax.axvline(n_pixels / 8 * i, color='red', lw=0.8) for i in range(9)]
-ax.set_title('Fitted line position minus input peak pixel\n(error bars: GP posterior std)')
-ax.set_xlabel('pixel')
-ax.set_ylabel('pixel')
-
-# --- FWHM(x), now in km/s, with resolving power on a twin axis -----------
-ax = axes[1, 3]
-fwhm_kms = 2.355 * line_width
-ax.plot(peak_pixel, fwhm_kms, lw=2, label='FWHM(x)')
-ax.axhline(EXPECTED_FWHM_KMS, color='k', ls='--', lw=1,
-           label=f'R={EXPECTED_R} ({EXPECTED_FWHM_KMS:.3f} km/s)')
-ax.legend(fontsize=8)
-ax.set_title('FWHM across the order (velocity)')
-ax.set_xlabel('pixel')
-ax.set_ylabel('FWHM [km/s]')
-ax_r = ax.twinx()
-ax_r.set_ylim(SPEED_OF_LIGHT_KMS / ax.get_ylim()[1], SPEED_OF_LIGHT_KMS / max(ax.get_ylim()[0], 1e-6))
-ax_r.set_ylabel('R = c / FWHM')
-
-# --- NEW: shape departure basis functions d_k(u), one per Chebyshev order
+# --- shape departure basis functions d_k(u), one per Chebyshev order -----
 # These ARE shape_coeffs -- the departure at any position x is
 # sum_k T_k(rescaled_position(x)) * d_k(u), so d_0(u) is the order-averaged
 # departure shape, d_1(u) is how much of a LINEAR-in-x correction gets
@@ -213,7 +169,7 @@ ax_r.set_ylabel('R = c / FWHM')
 # region most lines' own windows actually reach (using the median v_pix
 # across the order as a representative scale, since these basis functions
 # are shared across the whole order rather than evaluated at one position).
-ax = axes[2, 0]
+ax = axes[1, 0]
 median_half_range = HALF_WINDOW * np.median(v_pix)
 mask_shared = np.abs(u) <= median_half_range
 for k in range(shape_coeffs.shape[0]):
@@ -223,30 +179,60 @@ ax.legend(fontsize=8)
 ax.set_title('Shape departure basis functions d_k(u)\n(masked to median data-constrained u)')
 ax.set_xlabel('u [km/s]')
 
-# --- width sigma(x): now a GP grid with its own uncertainty band ---------
-# Reconstructed the same way width(x, ...) does in lsf_reconstruction_
-# velocity.py: log(sigma) is fit directly on the pixel grid via
-# gaussian_process_smooth, so there are no coefficients to show any more.
-ax = axes[2, 1]
+# =========================================================================
+# Width (x-space): FWHM(x) with uncertainty and resolving power, and the
+# raw per-line data that GP fit was built from
+# =========================================================================
+# The two previous versions of this plot each showed a separate FWHM(x)
+# panel (one from line_width interpolated at the comb lines, one from the
+# raw fitted grid) -- these were redundant, since line_width is itself
+# just an interpolation of the same grid. Merged into one panel here,
+# keeping BOTH pieces of information that were unique to each (the GP
+# uncertainty band, and the resolving-power twin axis).
+ax = axes[1, 1]
 sigma_grid = np.maximum(np.exp(width_coeffs), 0.05 * np.median(v_pix))
 fwhm_grid = 2.355 * sigma_grid
 fwhm_upper = 2.355 * np.exp(width_coeffs + width_log_sigma_std)
 fwhm_lower = 2.355 * np.exp(width_coeffs - width_log_sigma_std)
-ax.plot(pixel, fwhm_grid, color='tab:blue', lw=1.3)
+ax.plot(pixel, fwhm_grid, color='tab:blue', lw=1.3, label='FWHM(x)')
 ax.fill_between(pixel, fwhm_lower, fwhm_upper, color='tab:blue', alpha=0.3,
                 label='GP posterior std')
+ax.axhline(EXPECTED_FWHM_KMS, color='k', ls='--', lw=1,
+           label=f'R={EXPECTED_R} ({EXPECTED_FWHM_KMS:.3f} km/s)')
 ax.legend(fontsize=8)
 ax.set_xlim(peak_pixel.min() - 50, peak_pixel.max() + 50)
 ax.set_title('Width: FWHM(x) [km/s], from the fitted GP grid')
 ax.set_xlabel('pixel')
 ax.set_ylabel('FWHM [km/s]')
+ax_r = ax.twinx()
+ax_r.set_ylim(SPEED_OF_LIGHT_KMS / ax.get_ylim()[1], SPEED_OF_LIGHT_KMS / max(ax.get_ylim()[0], 1e-6))
+ax_r.set_ylabel('R = c / FWHM')
 
-# --- dispersion relation itself: pixel position vs wavelength ------------
-# Dispersion is now a Gaussian Process fit directly to (wavelength,
-# position) -- see lsf_reconstruction_velocity.py -- so there are no
-# polynomial coefficients to show any more; the natural replacement is the
-# relation itself, with its GP uncertainty band.
-ax = axes[2, 2]
+# --- raw per-line width data (pre-GP) vs the fitted GP curve --------------
+# Directly answers "does the GP curve look like a reasonable smoothing of
+# the actual per-line data, or is it doing something strange": each
+# line's own 1-parameter local correction (in log(sigma), before any
+# smoothing), with its formal uncertainty, plotted against the final
+# fitted grid. If the GP curve looks like a sensible smooth trend through
+# this scatter, the fit is behaving as intended; if the scatter looks
+# structured in a way the curve does not track, or the curve looks
+# unreasonably wiggly relative to the scatter, that is a sign of trouble
+# worth investigating directly here rather than only in the final FWHM(x).
+ax = axes[1, 2]
+ax.errorbar(line_position, width_raw_target, yerr=width_raw_target_err,
+            fmt='.', ms=4, elinewidth=0.5, capsize=0, alpha=0.5,
+            label='per-line target (pre-GP)')
+ax.plot(pixel, width_coeffs, '-', color='tab:orange', lw=1.5, label='GP-fitted curve')
+ax.legend(fontsize=8)
+ax.set_xlim(peak_pixel.min() - 50, peak_pixel.max() + 50)
+ax.set_title('Width: raw per-line data vs. fitted GP curve')
+ax.set_xlabel('pixel')
+ax.set_ylabel('log(sigma [km/s])')
+
+# =========================================================================
+# Dispersion (wavelength-space): the relation itself, and residuals
+# =========================================================================
+ax = axes[1, 3]
 wavelength_order = np.argsort(wavelength)
 lam_sorted = wavelength[wavelength_order]
 pos_sorted = line_position[wavelength_order]
@@ -259,6 +245,43 @@ ax.set_title('Dispersion relation: x(lambda)')
 ax.set_xlabel('wavelength [nm]')
 ax.set_ylabel('pixel')
 
+# --- dispersion residuals, with the GP's own uncertainty band ------------
+# Plotted against detector position (not line index), with vertical lines
+# at 1/8-detector boundaries: if a pattern lines up with these, that
+# points to a per-amplifier readout effect (many CCDs used in echelle
+# spectrographs are read out through several amplifiers, each covering an
+# equal share of the columns, and small gain/offset mismatches between
+# them show up exactly at these boundaries).
+ax = axes[2, 0]
+ax.errorbar(line_position, line_position - peak_pixel,
+            yerr=dispersion_position_std, fmt='.', ms=4, elinewidth=0.5, capsize=0)
+ax.axhline(0, color='gray', lw=0.5)
+[ax.axvline(n_pixels / 8 * i, color='red', lw=0.8) for i in range(9)]
+ax.set_title('Fitted line position minus input peak pixel\n(error bars: GP posterior std)')
+ax.set_xlabel('pixel')
+ax.set_ylabel('pixel')
+
+# =========================================================================
+# Overall fit diagnostics
+# =========================================================================
+ax = axes[2, 1]
+m = len(line_position) // 2
+i0, i1 = int(line_position[m]) - 8, int(line_position[m]) + 9
+idx = np.arange(i0, i1)
+ax.errorbar(idx, flux[idx], yerr=flux_err[idx], fmt='o', ms=3, label='data (normalised)')
+ax.plot(idx, model[idx], 'r-', label='model')
+ax.legend(fontsize=8)
+ax.set_title(f'Example line, FWHM = {2.355 * np.interp(line_position[m], line_position, line_width):.3f} km/s')
+ax.set_xlabel('pixel')
+
+ax = axes[2, 2]
+residual = (flux - model) / flux_err
+ax.plot(pixel[fitted_mask], residual[fitted_mask], '.', ms=2, alpha=0.4)
+ax.axhline(0, color='r', lw=0.8)
+ax.set_ylim(-30, 30)
+ax.set_title('Normalised residuals, (flux - model) / error')
+ax.set_xlabel('pixel')
+
 axes[2, 3].axis('off')
 
 plt.tight_layout()
@@ -267,10 +290,10 @@ print("Saved lsf_reconstruction_diagnostics.png")
 
 chi2_per_dof = np.sum(residual[fitted_mask]**2) / fitted_mask.sum()
 print(f"chi2 / dof = {chi2_per_dof:.2f}")
-print(f"FWHM(x) in [{fwhm_kms.min():.4f}, {fwhm_kms.max():.4f}] km/s "
+print(f"FWHM(x) in [{fwhm_grid.min():.4f}, {fwhm_grid.max():.4f}] km/s "
       f"(expected ~{EXPECTED_FWHM_KMS:.4f} km/s for R={EXPECTED_R})")
-print(f"resolving power R in [{SPEED_OF_LIGHT_KMS/fwhm_kms.max():.0f}, "
-      f"{SPEED_OF_LIGHT_KMS/fwhm_kms.min():.0f}]")
+print(f"resolving power R in [{SPEED_OF_LIGHT_KMS/fwhm_grid.max():.0f}, "
+      f"{SPEED_OF_LIGHT_KMS/fwhm_grid.min():.0f}]")
 print(f"rms(fitted position - input peak) = {np.sqrt(np.mean((line_position - peak_pixel)**2)):.4f} pix")
 
 # --- residual autocorrelation check, within each line's own window -------
