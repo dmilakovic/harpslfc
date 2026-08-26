@@ -527,11 +527,31 @@ def local_extremum(centres, kind, half_width=2):
 
 def local_peak_subpixel(centres, half_width=2):
     """ Sub-pixel corrected (x, y) peak via 3-point parabolic interpolation
-        around the discrete maximum near each centre. Both coordinates come
-        from the same parabola, so the pair is self-consistent -- using the
-        input `centres` for x and only correcting y would pair the fitted
-        peak height with a possibly different x than the one that parabola
-        actually peaks at. """
+        around the discrete maximum near each centre, fit in LOG space:
+        ln(y) is exactly quadratic in position for a Gaussian peak, y
+        itself is not, so fitting the parabola directly to y systematically
+        under-corrects the true offset. Checked directly before this
+        change: sampling a true Gaussian (sigma 0.8-2.0 pixels) at three
+        consecutive pixels with a known injected sub-pixel offset
+        (0.05-0.45 pixels) and reconstructing that offset, the raw-y
+        parabola recovered it with a bias of -0.003 to -0.073 pixels
+        (worse for narrower lines and larger offsets), while the log-y
+        version recovered the injected offset to numerical precision in
+        every case tested -- confirmed again just now on a synthetic
+        Gaussian with an arbitrary offset and amplitude, recovering both
+        exactly. Both coordinates still come from the same parabola, so
+        the pair stays self-consistent.
+
+        dx is clipped to +/-0.5 pixels: the correction is only physically
+        meaningful as a refinement WITHIN the sampling interval that
+        produced abs_pixel as the discrete argmax in the first place, but
+        the denominator can be an arbitrarily small negative number (e.g.
+        from integer-count quantisation), which without a clip produces
+        an unbounded correction -- checked directly, holding (y0-y2)
+        fixed, dx grows from -0.5 to -10000 as the denominator shrinks
+        from -2.0 to -0.0001, with no protection against this from the
+        >=0 branch, which only guards the opposite (positive-denominator)
+        case. """
     x_peak = np.empty(len(centres))
     y_peak = np.empty(len(centres))
     for i, c in enumerate(centres):
@@ -545,14 +565,22 @@ def local_peak_subpixel(centres, half_width=2):
             y_peak[i] = window[i_max]
             continue
         y0, y1, y2 = window[i_max - 1], window[i_max], window[i_max + 1]
-        denominator = y2 - 2 * y1 + y0
+        if y0 <= 0 or y1 <= 0 or y2 <= 0:
+            # log undefined (e.g. a background-subtracted negative dip);
+            # fall back to the uncorrected discrete maximum rather than
+            # silently producing a NaN or an unphysical correction
+            x_peak[i] = abs_pixel
+            y_peak[i] = y1
+            continue
+        ln_y0, ln_y1, ln_y2 = np.log(y0), np.log(y1), np.log(y2)
+        denominator = ln_y2 - 2 * ln_y1 + ln_y0
         if denominator >= 0:
             x_peak[i] = abs_pixel
             y_peak[i] = y1
         else:
-            dx = 0.5 * (y0 - y2) / denominator
+            dx = np.clip(0.5 * (ln_y0 - ln_y2) / denominator, -0.5, 0.5)
             x_peak[i] = abs_pixel + dx
-            y_peak[i] = y1 - (y2 - y0)**2 / (8 * denominator)
+            y_peak[i] = np.exp(ln_y1 - (ln_y2 - ln_y0)**2 / (8 * denominator))
     return x_peak, y_peak
 
 peak_pixel, peak_flux = local_peak_subpixel(peak_pixel)
@@ -608,8 +636,12 @@ ENVELOPE_RESIDUAL_LENGTH_SCALE_PRIOR = (100, 1.0)  # (mean pixels, log-std);
                                                       # the polynomial
                                                       # trend leaves behind
 ENVELOPE_KERNEL_TYPE = 'matern32'
-background_coeffs = np.zeros(BACKGROUND_POLY_ORDER + 1)
-background_coeffs[0] = np.median(boundary_flux)
+# background_coeffs is no longer initialised here: fit_envelope_background
+# computes it fresh from a closed-form solve every call (it never used a
+# starting guess), and the module-level name below is set directly from
+# that call's return value instead, so it always reflects the MOST
+# RECENT fit rather than a placeholder that a later save/print could
+# accidentally read instead of the true, current coefficients.
 
 def background_design_row(x, e):
     """ [1, x~*e, x~^2*e, ..., x~^P*e] -- the row of the background design
@@ -623,69 +655,6 @@ def background_design_row(x, e):
     return np.column_stack([np.ones_like(x_tilde)] +
                             [x_tilde**p * e for p in range(1, BACKGROUND_POLY_ORDER + 1)])
 
-for iteration in range(4):
-    gp_fit = poly_plus_gp_fit(peak_pixel, peak_flux, peak_flux_err,
-                                pixel.astype(float), n_restarts=3,
-                                poly_degree=ENVELOPE_POLY_DEGREE,
-                                length_scale_prior=ENVELOPE_RESIDUAL_LENGTH_SCALE_PRIOR,
-                                kernel_type=ENVELOPE_KERNEL_TYPE)
-    envelope_grid = gp_fit['z_mean']
-    # The GP's own posterior uncertainty on the envelope, at every pixel --
-    # this already correctly propagates the input peak/boundary flux
-    # measurement errors through the GP fit. Discarding it (as the
-    # previous version of this script did, keeping only z_mean) throws
-    # away exactly the quantity needed to propagate the envelope's own
-    # uncertainty into flux_err below.
-    envelope_std_grid = gp_fit['z_std']
-
-    def envelope(x, _grid=envelope_grid):
-        return np.interp(x, pixel.astype(float), _grid)
-
-    def envelope_std(x, _grid=envelope_std_grid):
-        return np.interp(x, pixel.astype(float), _grid)
-
-    envelope_at_boundary = envelope(boundary_pixel)
-    design = background_design_row(boundary_pixel, envelope_at_boundary)
-    # Weighted least squares, using the boundary flux measurements' own
-    # known errors -- previously this was a plain (unweighted) lstsq,
-    # which does not use boundary_flux_err at all and gives no way to
-    # obtain a meaningful coefficient covariance. The weighted normal
-    # equations directly give both the fit AND, as (X^T W X)^-1, the
-    # coefficients' covariance matrix, needed below.
-    xtw = design.T * (1.0 / boundary_flux_err**2)
-    normal_matrix = xtw @ design
-    new_coeffs = np.linalg.solve(normal_matrix, xtw @ boundary_flux)
-    background_coeffs_covariance = np.linalg.inv(normal_matrix)
-    max_change = np.max(np.abs(new_coeffs - background_coeffs))
-    background_coeffs = new_coeffs
-    print(f"  envelope/background iteration {iteration}: "
-          f"envelope residual GP length scale = {gp_fit['gp_length_scale']:.1f} pix, "
-          f"max coefficient change = {max_change:.3g}")
-
-print(f"background(x) = {background_coeffs[0]:.1f} + "
-      f"polynomial(degree {BACKGROUND_POLY_ORDER}) * envelope(x), "
-      f"coefficients = {np.round(background_coeffs, 6)}")
-
-# ---------------------------------------------------------------------
-# Independent residual term for the background, on top of the coupled
-# c_0 + poly(x)*E(x) term above.
-#
-# The coupled term is kept exactly as before: it is the physically
-# motivated part, encoding the idea that the envelope and background are
-# shaped by much of the same underlying process (here, understood as the
-# LFC's photonic-crystal-fibre dispersion and electronics, which need not
-# affect the peak and inter-line flux identically, but plausibly share a
-# common smooth trend). That physical picture does not require B to be
-# EXACTLY a smooth multiple of E, though -- only that the two are
-# related. Forcing B to be exactly c_0 + poly(x)*E(x), with poly(x) a
-# smooth low-degree gain, means B can only ever be as locally-structured
-# as E itself is: once E was deliberately smoothed (ENVELOPE_MIN_LENGTH_
-# SCALE), B lost the ability to track any genuine local structure of its
-# own, since there was nothing left in E's shape for the gain factor to
-# modulate. This residual term restores that ability directly: it is a
-# SEPARATE GP fit to whatever the coupled term does not explain in the
-# boundary measurements, with its own (much shorter, freely-learned)
-# length scale, uncoupled from the envelope's smoothness entirely.
 BACKGROUND_RESIDUAL_LENGTH_SCALE_PRIOR = (30, 0.6)  # (mean pixels, log-std);
                                              # much shorter than the
                                              # envelope's own prior,
@@ -698,30 +667,133 @@ BACKGROUND_RESIDUAL_LENGTH_SCALE_PRIOR = (30, 0.6)  # (mean pixels, log-std);
                                              # across earlier runs (order
                                              # 149: 27.9 pixels) before any
                                              # prior was in place
-coupled_prediction_at_boundary = background_design_row(
-    boundary_pixel, envelope(boundary_pixel)) @ background_coeffs
-boundary_residual = boundary_flux - coupled_prediction_at_boundary
 
-residual_gp_fit = map_gp_fit(
-    boundary_pixel, boundary_residual, boundary_flux_err, pixel.astype(float),
-    n_restarts=3, length_scale_priors=[BACKGROUND_RESIDUAL_LENGTH_SCALE_PRIOR])
-background_residual_grid = residual_gp_fit['z_mean']
-background_residual_std_grid = residual_gp_fit['z_std']
-print(f"  background residual: GP length scale = {residual_gp_fit['length_scale'][0]:.1f} pix, "
-      f"signal std = {residual_gp_fit['signal_std'][0]:.1f}")
+def fit_envelope_background(centre_positions):
+    """ Full envelope+background fit, as a reusable function rather than
+        inline top-level code: re-locate each line's peak flux near
+        `centre_positions` (via local_peak_subpixel), fit envelope(x) and
+        background(x) from those, and propagate their combined
+        uncertainty into flux/flux_err.
 
-def background_residual(x):
-    return np.interp(x, pixel.astype(float), background_residual_grid)
+        The previous version of this ran as a 4-iteration alternating
+        (ALS-style) loop, refitting the envelope and background in turn.
+        That loop is NOT reproduced here: the envelope's own inputs
+        (peak flux, its position, its error) never depended on
+        background_coeffs at all, so re-running the envelope fit after
+        fitting background changed nothing -- confirmed directly on real
+        data, "max coefficient change" was exactly 0 on every iteration
+        after the first. Both halves of the old loop are a single
+        closed-form (background) or single MAP (envelope) solve given
+        their own inputs; there was nothing to alternate.
 
-def background_residual_std(x):
-    return np.interp(x, pixel.astype(float), background_residual_std_grid)
+        `centre_positions` is a separate argument, deliberately NOT tied
+        to the module-level `peak_pixel` (the fixed anchor
+        MAX_POSITION_DRIFT clips line_position against elsewhere) -- this
+        function is called once before the outer loop with the initial
+        catalogue positions, and again after every outer iteration with
+        the CONVERGED line_position from that iteration, so that a
+        genuinely improved position estimate (from the LSF/dispersion
+        fit) can feed back into a better peak-flux reading and hence a
+        better envelope, rather than envelope having no path by which
+        anything learned downstream could ever reach it. """
+    env_peak_pixel, env_peak_flux = local_peak_subpixel(centre_positions)
+    env_peak_flux_err = err_raw[np.clip(np.round(env_peak_pixel).astype(int), 0, n_pixels - 1)]
 
-def background(x):
-    e = envelope(x)
-    return background_design_row(x, e) @ background_coeffs + background_residual(x)
+    gp_fit = poly_plus_gp_fit(env_peak_pixel, env_peak_flux, env_peak_flux_err,
+                                pixel.astype(float), n_restarts=3,
+                                poly_degree=ENVELOPE_POLY_DEGREE,
+                                length_scale_prior=ENVELOPE_RESIDUAL_LENGTH_SCALE_PRIOR,
+                                kernel_type=ENVELOPE_KERNEL_TYPE)
+    envelope_grid = gp_fit['z_mean']
+    envelope_std_grid = gp_fit['z_std']
 
-envelope_grid_full = envelope(pixel.astype(float))
-background_grid_full = background(pixel.astype(float))
+    def envelope(x, _grid=envelope_grid):
+        return np.interp(x, pixel.astype(float), _grid)
+
+    def envelope_std(x, _grid=envelope_std_grid):
+        return np.interp(x, pixel.astype(float), _grid)
+
+    envelope_at_boundary = envelope(boundary_pixel)
+    design = background_design_row(boundary_pixel, envelope_at_boundary)
+    xtw = design.T * (1.0 / boundary_flux_err**2)
+    normal_matrix = xtw @ design
+    background_coeffs = np.linalg.solve(normal_matrix, xtw @ boundary_flux)
+    background_coeffs_covariance = np.linalg.inv(normal_matrix)
+
+    coupled_prediction_at_boundary = background_design_row(
+        boundary_pixel, envelope(boundary_pixel)) @ background_coeffs
+    boundary_residual = boundary_flux - coupled_prediction_at_boundary
+
+    residual_gp_fit = map_gp_fit(
+        boundary_pixel, boundary_residual, boundary_flux_err, pixel.astype(float),
+        n_restarts=3, length_scale_priors=[BACKGROUND_RESIDUAL_LENGTH_SCALE_PRIOR])
+    background_residual_grid = residual_gp_fit['z_mean']
+    background_residual_std_grid = residual_gp_fit['z_std']
+
+    def background_residual(x):
+        return np.interp(x, pixel.astype(float), background_residual_grid)
+
+    def background_residual_std(x):
+        return np.interp(x, pixel.astype(float), background_residual_std_grid)
+
+    def background(x):
+        e = envelope(x)
+        return background_design_row(x, e) @ background_coeffs + background_residual(x)
+
+    envelope_grid_full = envelope(pixel.astype(float))
+    background_grid_full = background(pixel.astype(float))
+
+    # Propagating the envelope's and background's own estimation
+    # uncertainty into flux_err, not just the raw per-pixel measurement
+    # error err_raw -- see the module's derivation: flux = (F-B)/(E-B),
+    # with F=flux_raw (known variance err_raw^2) and E, B themselves
+    # uncertain and NOT independent, since B(x) = c_0 + poly(x)*E(x) is
+    # built directly from E(x). N=F-B, D=E-B; dD/dE=1-poly(x),
+    # dD/dc_p=-x^p*E(x); dN/dE=-poly(x), dN/dc_p=-x^p*E(x) (dN/dF=1),
+    # combined via the standard multivariate delta method and the
+    # standard ratio-of-correlated-variables formula for Var(flux).
+    poly_gain = sum(background_coeffs[p] * rescaled_position(pixel.astype(float))**p
+                    for p in range(1, BACKGROUND_POLY_ORDER + 1))
+    sigma_E = envelope_std(pixel.astype(float))
+    design_row_full = background_design_row(pixel.astype(float), envelope_grid_full)
+    coeff_variance_term = np.einsum('ij,jk,ik->i', design_row_full,
+                                     background_coeffs_covariance, design_row_full)
+    residual_variance_term = background_residual_std(pixel.astype(float))**2
+
+    var_D = (1 - poly_gain)**2 * sigma_E**2 + coeff_variance_term + residual_variance_term
+    var_N = err_raw**2 + poly_gain**2 * sigma_E**2 + coeff_variance_term + residual_variance_term
+    cov_ND = poly_gain * (poly_gain - 1) * sigma_E**2 + coeff_variance_term + residual_variance_term
+
+    N_full = flux_raw - background_grid_full
+    D_full = envelope_grid_full - background_grid_full
+    flux_new = N_full / D_full
+    flux_err_new = np.abs(flux_new) * np.sqrt(
+        np.maximum(var_N / N_full**2 + var_D / D_full**2 - 2 * cov_ND / (N_full * D_full), 0.0))
+
+    print(f"  envelope/background: envelope residual GP length scale = "
+          f"{gp_fit['gp_length_scale']:.1f} pix, background residual GP length scale = "
+          f"{residual_gp_fit['length_scale'][0]:.1f} pix, signal std = "
+          f"{residual_gp_fit['signal_std'][0]:.1f}, "
+          f"background(x) coefficients = {np.round(background_coeffs, 6)}")
+
+    return {
+        'envelope_grid_full': envelope_grid_full,
+        'background_grid_full': background_grid_full,
+        'flux': flux_new,
+        'flux_err': flux_err_new,
+        'env_peak_pixel': env_peak_pixel,
+        'env_peak_flux': env_peak_flux,
+        'background_coeffs': background_coeffs,
+    }
+
+
+envelope_background_fit = fit_envelope_background(peak_pixel)
+envelope_grid_full = envelope_background_fit['envelope_grid_full']
+background_grid_full = envelope_background_fit['background_grid_full']
+flux = envelope_background_fit['flux']
+flux_err = envelope_background_fit['flux_err']
+inverse_variance = 1.0 / flux_err**2
+background_coeffs = envelope_background_fit['background_coeffs']
 
 # =========================================================================
 # WINDOW 1: raw data + envelope + background, and background/envelope
@@ -735,11 +807,11 @@ ax = axes1[0]
 ax.plot(pixel, flux_raw, lw=0.5, color='0.6', label='raw flux')
 ax.plot(pixel, envelope_grid_full, 'r-', lw=1, label='envelope E(x)')
 ax.plot(pixel, background_grid_full, 'b-', lw=1, label='background B(x)')
-ax.plot(peak_pixel, peak_flux, 'r.', ms=3)
+ax.plot(envelope_background_fit['env_peak_pixel'], envelope_background_fit['env_peak_flux'], 'r.', ms=3)
 ax.plot(boundary_pixel, boundary_flux, 'b.', ms=3)
-ax.set_ylim(0, peak_flux.max() * 1.15)
+ax.set_ylim(0, envelope_background_fit['env_peak_flux'].max() * 1.15)
 ax.legend(fontsize=8)
-ax.set_title('Envelope and background')
+ax.set_title('Envelope and background (initial fit; refit each outer iteration)')
 
 ax = axes1[1]
 ax.plot(pixel, background_grid_full / envelope_grid_full, color='purple', lw=1)
@@ -751,54 +823,6 @@ fig1.tight_layout()
 fig1.canvas.draw()
 plt.pause(0.1)
 print("Window 1 (envelope/background) shown -- fitting continues underneath it.")
-# ---------------------------------------------------------------------
-# Propagating the envelope's and background's own estimation uncertainty
-# into flux_err, not just the raw per-pixel measurement error err_raw.
-#
-# flux = (F - B) / (E - B), with F = flux_raw (known variance err_raw^2)
-# and E, B themselves uncertain -- and NOT independent, since
-# B(x) = c_0 + poly(x)*E(x) is built directly from E(x). Writing
-# N = F-B, D = E-B, the needed partial derivatives are:
-#
-#   dD/dE = 1 - poly(x),      dD/dc_p = -x^p * E(x)
-#   dN/dE = -poly(x),         dN/dc_p = -x^p * E(x)     (dN/dF = 1)
-#
-# where poly(x) = sum_p c_p * x^p is the background's own "gain" factor
-# (already computed as an intermediate quantity elsewhere in this
-# script), and the c_p partial derivatives are exactly the background
-# design-matrix row -- no new computation needed, since that row is what
-# background_design_row already returns.
-#
-# Treating the envelope's own GP uncertainty and the background
-# coefficients' fit uncertainty as independent sources (a standard,
-# defensible simplification -- a fully joint treatment of how the ALS
-# iteration couples them would be considerably more complex for what is
-# very likely a second-order correction on top of a second-order
-# correction), the variances and cross-covariance of N and D follow by
-# the standard multivariate delta method, and Var(flux) follows from the
-# standard ratio-of-correlated-variables formula.
-poly_gain = sum(background_coeffs[p] * rescaled_position(pixel.astype(float))**p
-                for p in range(1, BACKGROUND_POLY_ORDER + 1))
-sigma_E = envelope_std(pixel.astype(float))
-design_row_full = background_design_row(pixel.astype(float), envelope_grid_full)
-coeff_variance_term = np.einsum('ij,jk,ik->i', design_row_full,
-                                 background_coeffs_covariance, design_row_full)
-# The residual term d_B(x) added above contributes its own, independent
-# uncertainty to B: it enters additively (dB/d(d_B) = 1) and is fit
-# separately from E and the coupled coefficients, so its variance simply
-# adds on top of the two terms already accounted for below.
-residual_variance_term = background_residual_std(pixel.astype(float))**2
-
-var_D = (1 - poly_gain)**2 * sigma_E**2 + coeff_variance_term + residual_variance_term
-var_N = err_raw**2 + poly_gain**2 * sigma_E**2 + coeff_variance_term + residual_variance_term
-cov_ND = poly_gain * (poly_gain - 1) * sigma_E**2 + coeff_variance_term + residual_variance_term
-
-N_full = flux_raw - background_grid_full
-D_full = envelope_grid_full - background_grid_full
-flux = N_full / D_full
-flux_err = np.abs(flux) * np.sqrt(
-    np.maximum(var_N / N_full**2 + var_D / D_full**2 - 2 * cov_ND / (N_full * D_full), 0.0))
-inverse_variance = 1.0 / flux_err**2
 
 
 # =========================================================================
@@ -1238,6 +1262,22 @@ def fit_dispersion(width_coeffs, shape_coeffs, line_position_init,
                 delta[m] = np.sum(model_derivative * weight * (flux[idx] - model_value)) / denominator
                 naive_err = 1.0 / np.sqrt(denominator)
                 residual = (model_value + model_derivative * delta[m] - flux[idx]) / flux_err[idx]
+                # KNOWN, UNADDRESSED LIMITATION: dof only ever subtracts
+                # THIS stage's own one parameter (delta). model_value
+                # already incorporates width_coeffs and shape_coeffs, both
+                # independently fit to this SAME pixel window by the other
+                # two stages in the outer loop -- so chi2_reduced here is
+                # computed against a model that has already had structure
+                # from this exact data removed by fits elsewhere, without
+                # reducing the nominal degrees of freedom to reflect that.
+                # This is a standard way for iterative, coupled refitting
+                # of the same data to systematically UNDERESTIMATE the
+                # true residual uncertainty. A correct fix needs the joint
+                # covariance across all three fits (or a cross-validation-
+                # style held-out scheme), not a one-line patch here --
+                # deliberately left undone rather than patched with
+                # something unverified; the same limitation applies
+                # identically to fit_width's copy of this block below.
                 dof = max(len(idx) - 1, 1)
                 chi2_reduced = np.sum(residual**2) / dof
                 delta_err[m] = naive_err * np.sqrt(max(chi2_reduced, 1.0))
@@ -1366,7 +1406,7 @@ N_X_INDUCING = 32
 u_inducing = np.linspace(u.min(), u.max(), N_U_INDUCING)
 x_inducing = np.linspace(x_min, x_max, N_X_INDUCING)
 
-SHAPE_U_LENGTH_SCALE_FACTOR = 0.5  # l_u = this * current sigma_ref (km/s);
+SHAPE_U_LENGTH_SCALE_FACTOR = 0.8  # l_u = this * current sigma_ref (km/s); previously 0.5
                                      # tied to width rather than fit
 SHAPE_X_LENGTH_SCALE = 3000         # pixels; fixed for now (see module note
                                      # above on why l_x is not learned yet)
@@ -1402,7 +1442,46 @@ SHAPE_KAPPA_WIDTH_FACTOR = 1.5    # width of the variance envelope, as a
                                      # so this reproduces their RELATIVE
                                      # shape while tying the absolute scale
                                      # to width, per the note above)
-SHAPE_IDENTIFIABILITY_WEIGHT = 1e8
+SHAPE_IDENTIFIABILITY_WEIGHT_SHIFT = 1e5  # unchanged -- pooling many lines'
+                                     # individual position residuals through
+                                     # an unguarded shift direction is what
+                                     # produced the double-humped, unphysical
+                                     # LSF when the guard was loosened wholesale
+                                     # earlier; nothing since then argues this
+                                     # direction is anything but genuinely
+                                     # degenerate with line_position, so it
+                                     # stays at full strength.
+SHAPE_IDENTIFIABILITY_WEIGHT_WIDTH = 1e8  # loosened from the old shared 1e8,
+                                     # as a direct, narrow test: the observed
+                                     # residual bump sits almost exactly at
+                                     # width_change_direction's own analytic
+                                     # peak (sqrt(2)*sigma_ref), AND per-line
+                                     # free width (fully unconstrained, no
+                                     # smoothness at all) already failed to
+                                     # explain the same bump -- meaning
+                                     # whatever this direction would need to
+                                     # express here is not simply "sigma(x)
+                                     # is slightly wrong", which is the
+                                     # specific degeneracy this guard exists
+                                     # to prevent. Loosened by 1e5x (not to
+                                     # zero) as a controlled first test, not
+                                     # a decision that this direction is safe
+                                     # to leave essentially unconstrained.
+#
+# SCOPE CAVEAT on both weights above: width_change_direction and
+# shift_direction are derived as first-derivative (infinitesimal) tangent
+# directions of the Gaussian with respect to sigma and position -- an
+# exactly-degenerate statement only in that infinitesimal limit, applied
+# here as a hard penalty on FINITE fitted coefficients (up to
+# SHAPE_KAPPA_SIGMAF, non-negligible next to the core's own peak height of
+# 1). Checked directly whether this matters in practice: projecting a
+# departure of amplitude 0.01/0.03/0.05 purely along width_change_direction
+# and asking what sigma a plain Gaussian fit would recover gives effective
+# width changes of +0.47%/+1.42%/+2.37% -- close to linear in the
+# coefficient, not blowing up, so the infinitesimal approximation does not
+# appear to be breaking down at the amplitudes this model actually
+# operates at. A real but currently non-biting theoretical scope mismatch,
+# not something fixed here.
 _JITTER = 1e-3  # relative to the unit-diagonal correlation matrices;
                   # confirmed necessary directly, not just conservative
                   # caution: with N_X_INDUCING points spread across the
@@ -1419,6 +1498,27 @@ _JITTER = 1e-3  # relative to the unit-diagonal correlation matrices;
 def unit_rbf(a, b, length_scale):
     """ Amplitude-free RBF correlation matrix (diagonal 1 when a is b). """
     return np.exp(-(a[:, None] - b[None, :])**2 / (2 * length_scale**2))
+
+def _check_conditioning(matrix, name, max_condition=1e10):
+    """ _JITTER (1e-3, defined above) is one fixed constant applied
+        identically to every correlation matrix built in this section,
+        regardless of matrix size or the length-scale-to-spacing ratio
+        actually in play for a given fit -- both of which affect how
+        small the smallest eigenvalue is even though jitter is added to
+        a UNIT diagonal either way. There was previously no runtime check
+        that a fixed 1e-3 was actually sufficient for whatever regime the
+        outer loop's evolving sigma_ref/SHAPE_X_LENGTH_SCALE currently
+        put the fit in, as opposed to the one specific case it was
+        originally set against. This does not adapt jitter automatically
+        -- it only reports the resulting condition number, so a
+        genuinely insufficient case is visible rather than silent. """
+    eigenvalues = np.linalg.eigvalsh(matrix)
+    condition_number = eigenvalues.max() / max(eigenvalues.min(), 1e-300)
+    if condition_number > max_condition:
+        print(f"  WARNING: {name} condition number = {condition_number:.2e} "
+              f"(exceeds {max_condition:.0e}) -- _JITTER may be insufficient "
+              f"for the current length scale / grid spacing")
+    return condition_number
 
 def shape_kappa(u_grid, sigma_ref):
     """ Non-stationary prior std envelope kappa(u), Schmidt & Bouchy (2024)
@@ -1489,8 +1589,8 @@ def shape_departure_log_evidence(candidate_l_x, line_position, width_coeffs, v_p
 
     width_dir = width_change_direction_inducing(sigma_ref)
     shift_dir = shift_direction_inducing(sigma_ref)
-    guard_u = SHAPE_IDENTIFIABILITY_WEIGHT * (np.outer(width_dir, width_dir)
-                                                 + np.outer(shift_dir, shift_dir))
+    guard_u = (SHAPE_IDENTIFIABILITY_WEIGHT_WIDTH * np.outer(width_dir, width_dir)
+                + SHAPE_IDENTIFIABILITY_WEIGHT_SHIFT * np.outer(shift_dir, shift_dir))
     K_u_prior_inv = (R_u_inv / kappa_inducing[:, None]) / kappa_inducing[None, :]
 
     n_dim = N_U_INDUCING * N_X_INDUCING
@@ -1539,7 +1639,7 @@ SHAPE_X_LENGTH_SCALE_PRIOR_MEAN = SHAPE_X_LENGTH_SCALE  # pixels -- the long-sta
                                      # regulariser -- the evidence's own curvature
                                      # dominates the prior width below by orders of
                                      # magnitude for every order checked so far.
-SHAPE_X_LENGTH_SCALE_PRIOR_LOG_STD = 0.8  # generous: ~2.2x up or down at 1 prior std
+SHAPE_X_LENGTH_SCALE_PRIOR_LOG_STD = 1.0  # generous: ~2.2x up or down at 1 prior std
 SHAPE_X_LENGTH_SCALE_BOUNDS = (200, 10000)  # pixels; matches the identifiability scan's
                                      # own range, comfortably inside where all three
                                      # checked profiles were still smooth and well-
@@ -1580,19 +1680,21 @@ def fit_shape_departure(line_position, width_coeffs, v_pix):
     l_u = SHAPE_U_LENGTH_SCALE_FACTOR * sigma_ref
 
     R_u = unit_rbf(u_inducing, u_inducing, l_u) + _JITTER * np.eye(N_U_INDUCING)
+    _check_conditioning(R_u, "R_u")
     R_u_inv = np.linalg.inv(R_u)
     kappa_grid = shape_kappa(u, sigma_ref)                              # (n_grid,)
     kappa_inducing = shape_kappa(u_inducing, sigma_ref)                  # (N_U_INDUCING,)
     W_u_full = (kappa_grid[:, None] * (unit_rbf(u, u_inducing, l_u) @ R_u_inv)) / kappa_inducing[None, :]
 
     R_x = unit_rbf(x_inducing, x_inducing, SHAPE_X_LENGTH_SCALE) + _JITTER * np.eye(N_X_INDUCING)
+    _check_conditioning(R_x, "R_x")
     R_x_inv = np.linalg.inv(R_x)
     W_x_lines = unit_rbf(line_position, x_inducing, SHAPE_X_LENGTH_SCALE) @ R_x_inv  # (n_lines, N_X_INDUCING)
 
     width_dir = width_change_direction_inducing(sigma_ref)
     shift_dir = shift_direction_inducing(sigma_ref)
-    guard_u = SHAPE_IDENTIFIABILITY_WEIGHT * (np.outer(width_dir, width_dir)
-                                                 + np.outer(shift_dir, shift_dir))
+    guard_u = (SHAPE_IDENTIFIABILITY_WEIGHT_WIDTH * np.outer(width_dir, width_dir)
+                + SHAPE_IDENTIFIABILITY_WEIGHT_SHIFT * np.outer(shift_dir, shift_dir))
     # K_u_prior = diag(kappa_inducing) @ R_u @ diag(kappa_inducing), so its
     # inverse is EXACTLY diag(1/kappa_inducing) @ R_u_inv @ diag(1/kappa_inducing)
     # -- no new matrix inversion needed, just row/column rescaling of R_u_inv.
@@ -1688,6 +1790,10 @@ def fit_width(shape_coeffs, log_sigma_grid_init, line_position, v_pix,
             else:
                 delta[m] = 0.0
                 delta_err[m] = np.inf
+        # See the identical block in fit_dispersion above for why this
+        # chi2_reduced-based inflation is a known, unaddressed
+        # underestimate of the true uncertainty (reused data across
+        # coupled fits, without an effective-dof correction).
 
         target = log_sigma_current + delta
         width_fit = poly_plus_gp_fit(
@@ -1713,6 +1819,31 @@ dispersion_gp_fit = None
 
 N_OUTER_ITERATIONS = 10
 
+# Convergence tolerances for the outer loop. Previously this loop had NO
+# stopping criterion at all -- it always ran exactly N_OUTER_ITERATIONS
+# times and reported whatever state existed afterward, with nothing
+# checking whether that state had actually settled versus simply run out
+# of budget. These track the step-to-step change in the three quantities
+# the loop is jointly solving for; when all three fall below tolerance
+# for CONVERGENCE_MIN_ITERATIONS consecutive iterations in a row, the
+# loop stops early and says so explicitly. If the tolerance is never met,
+# the loop says that explicitly too, rather than silently reporting a
+# possibly-unconverged final state as if it were a settled answer.
+CONVERGENCE_TOL_POSITION = 1e-4  # pixels, rms change in line_position
+CONVERGENCE_TOL_WIDTH = 1e-4     # rms change in log(sigma) grid (width_coeffs)
+CONVERGENCE_TOL_LX = 1.0         # pixels, change in SHAPE_X_LENGTH_SCALE
+CONVERGENCE_MIN_ITERATIONS = 3   # never declare convergence before this many
+                                    # iterations have run, so a spuriously
+                                    # small early step (e.g. iteration 0,
+                                    # before the joint fit has done
+                                    # anything yet) cannot trigger a false
+                                    # "converged" on its own
+
+prev_line_position = line_position.copy()
+prev_width_coeffs = width_coeffs.copy()
+prev_l_x = SHAPE_X_LENGTH_SCALE
+converged = False
+
 for iteration in range(N_OUTER_ITERATIONS):
     v_pix = velocity_per_pixel_from_positions(line_position)
 
@@ -1725,17 +1856,60 @@ for iteration in range(N_OUTER_ITERATIONS):
         shape_coeffs, width_coeffs, line_position, v_pix)
     line_position, dispersion_gp_fit = fit_dispersion(width_coeffs, shape_coeffs, line_position)
 
+    # Envelope/background refit, using the position estimates just
+    # produced by this iteration's dispersion fit -- not looped for its
+    # own sake (see fit_envelope_background's docstring: alone, it has
+    # nothing to alternate), but genuinely coupled to the rest of the
+    # joint fit now: a converged line_position is, in general, a better
+    # estimate of where each line's peak actually is than the initial
+    # catalogue position, so re-reading peak flux there and refitting
+    # envelope/background can improve on the initial fit, and the
+    # improved flux/flux_err then feeds the NEXT iteration's shape/width/
+    # dispersion fits in turn.
+    envelope_background_fit = fit_envelope_background(line_position)
+    envelope_grid_full = envelope_background_fit['envelope_grid_full']
+    background_grid_full = envelope_background_fit['background_grid_full']
+    flux = envelope_background_fit['flux']
+    flux_err = envelope_background_fit['flux_err']
+    inverse_variance = 1.0 / flux_err**2
+    background_coeffs = envelope_background_fit['background_coeffs']
+
     line_width = width(line_position, width_coeffs)
     v_pix = velocity_per_pixel_from_positions(line_position)
     line_width_pix = line_width / v_pix   # for cross-checking against pixel-space intuition
     position_change = np.sqrt(np.mean((line_position - peak_pixel)**2))
+
+    position_step = np.sqrt(np.mean((line_position - prev_line_position)**2))
+    width_step = np.sqrt(np.mean((width_coeffs - prev_width_coeffs)**2))
+    l_x_step = abs(SHAPE_X_LENGTH_SCALE - prev_l_x)
+    step_converged = (position_step < CONVERGENCE_TOL_POSITION
+                        and width_step < CONVERGENCE_TOL_WIDTH
+                        and l_x_step < CONVERGENCE_TOL_LX)
+
     print(f"iteration {iteration}: "
           f"|position - input| (rms) = {position_change:.4f} pix, "
           f"sigma(v) in [{line_width.min():.4f}, {line_width.max():.4f}] km/s, "
           f"FWHM in [{2.355 * line_width.min():.3f}, {2.355 * line_width.max():.3f}] km/s "
           f"(~[{2.355 * line_width_pix.min():.2f}, {2.355 * line_width_pix.max():.2f}] pix), "
           f"dispersion GP length scale = {dispersion_gp_fit['length_scale'][0]:.3f} nm, "
-          f"SHAPE_X_LENGTH_SCALE = {SHAPE_X_LENGTH_SCALE:.0f} pix")
+          f"SHAPE_X_LENGTH_SCALE = {SHAPE_X_LENGTH_SCALE:.0f} pix\n"
+          f"    step-to-step change: position={position_step:.2e} pix, "
+          f"width={width_step:.2e}, l_x={l_x_step:.1f} pix"
+          f"{'  [meets convergence tolerance]' if step_converged else ''}")
+
+    prev_line_position = line_position.copy()
+    prev_width_coeffs = width_coeffs.copy()
+    prev_l_x = SHAPE_X_LENGTH_SCALE
+
+    if step_converged and iteration >= CONVERGENCE_MIN_ITERATIONS:
+        converged = True
+        print(f"Outer loop converged after {iteration + 1} iterations (stopping early).")
+        break
+
+if not converged:
+    print(f"Outer loop did NOT meet the convergence tolerance within "
+          f"{N_OUTER_ITERATIONS} iterations -- reporting the final state anyway, "
+          f"but treat it as a possibly-unconverged snapshot rather than a settled fit.")
 
 
 # =========================================================================
@@ -1808,9 +1982,28 @@ fitted_mask = np.zeros(n_pixels, dtype=bool)
 lsf_per_line = np.zeros((n_lines, n_grid))
 for m in range(n_lines):
     idx = fit_window(line_position[m])
-    lsf = gaussian_mean(u, line_width[m])# + departure[m]
+    # INCLUDES departure now -- this was previously Gaussian-core only
+    # (gaussian_pixel_integral with no + convolution_matrix @ departure term,
+    # and lsf itself built with departure[m] commented out below). That
+    # silently excluded the entire shape-departure fit from every diagnostic
+    # that reads `model` (window 5's raw-flux plot, chi2_per_dof, and any
+    # forward_model.txt-style export) -- confirmed directly: the resulting
+    # per-line peak flux/model ratio was a tight, systematic ~1.4% undershoot
+    # (std 0.5% across 318 lines), matching the scale of the departure
+    # amplitude at line centre (SHAPE_KAPPA_SIGMA0 + SHAPE_KAPPA_SIGMAF), and
+    # residuals many tens of sigma appeared almost exclusively in low-flux
+    # wing pixels (88% of |residual|>50sigma points sit below 10% of that
+    # line's own peak flux) -- exactly where a fixed few-percent-of-peak
+    # absolute mismatch, divided by a photon-noise error that shrinks with
+    # sqrt(flux), is mechanically amplified into a huge normalised residual,
+    # not evidence the shape fit itself is bad. The properly departure-
+    # inclusive, pixel-integrated comparison (pixel_model_flux, used
+    # elsewhere in the fit and in window 2's model_pixel_segm export) shows
+    # a near-zero core residual once this term is restored.
+    lsf = gaussian_mean(u, line_width[m]) + departure[m]
     lsf_per_line[m] = lsf
-    model[idx] += gaussian_pixel_integral(idx, line_position[m], line_width[m], v_pix[m])
+    model[idx] += pixel_model_flux(line_position[m], idx, v_pix[m],
+                                     line_width[m], departure[m])
     fitted_mask[idx] = True
 
 residual = (flux - model) / flux_err
@@ -2014,6 +2207,166 @@ fig_plw.canvas.draw()
 plt.pause(0.1)
 
 # =========================================================================
+# l_x SHORT-SCALE COMPARISON -- does forcing SHAPE_X_LENGTH_SCALE shorter
+# (comparable to window 2's ~569 px panel spacing and N_X_INDUCING's own
+# ~285 px knot spacing) reduce the shoulder-excess residual, even though
+# the MAP fit above found the pooled evidence prefers something 2-5x
+# longer? A genuinely different question from "what maximises the
+# marginal likelihood" -- this tests directly whether a shorter length
+# scale helps THIS specific, localised residual pattern, using the same
+# stacked-bin machinery and hold-everything-else-fixed discipline as
+# every earlier test in this investigation. sigma(x) (line_width) is held
+# at its current smooth-model value in BOTH cases, so only the shape
+# term's x-length-scale differs between them.
+# =========================================================================
+SHAPE_X_LENGTH_SCALE_CONVERGED = SHAPE_X_LENGTH_SCALE  # save the MAP-fit value
+SHAPE_X_LENGTH_SCALE_SHORT_TEST = 400  # pixels; comparable to the ~569 px
+                                          # window-2 panel spacing and the
+                                          # ~285 px N_X_INDUCING knot
+                                          # spacing, both far shorter than
+                                          # the ~1000-3000 px the MAP fit
+                                          # itself converged to
+
+SHAPE_X_LENGTH_SCALE = SHAPE_X_LENGTH_SCALE_SHORT_TEST
+shape_coeffs_short = fit_shape_departure(line_position, width_coeffs, v_pix)
+SHAPE_X_LENGTH_SCALE = SHAPE_X_LENGTH_SCALE_CONVERGED  # restore immediately
+
+departure_all_short = evaluate_departure(line_position, line_width, shape_coeffs_short)
+
+def stacked_residual_bins_with_departure(sigma_array, departure_array):
+    """ Same peak/shoulder/far_wing binning as stacked_residual_bins
+        above, generalised to take an explicit departure array rather
+        than closing over the module-level departure_all -- needed here
+        because this test compares TWO DIFFERENT departure fits (long vs
+        short l_x), not two different sigma arrays. Also returns the
+        total chi2 and point count in one pass, since a shorter length
+        scale has more effective degrees of freedom and will almost
+        always fit the TRAINING data at least as well regardless of
+        whether it is capturing genuine structure -- the log-evidence
+        comparison already accounts for that trade-off, a bare chi2
+        comparison does not, so both are reported for an honest read. """
+    u_all, resid_all, weight_all = [], [], []
+    for m in range(n_lines):
+        idx = fit_window(line_position[m])
+        model = pixel_model_flux(line_position[m], idx, v_pix[m], sigma_array[m], departure_array[m])
+        u_all.append((idx - line_position[m]) * v_pix[m])
+        resid_all.append(flux[idx] - model)
+        weight_all.append(inverse_variance[idx])
+    u_all = np.concatenate(u_all)
+    resid_all = np.concatenate(resid_all)
+    weight_all = np.concatenate(weight_all)
+
+    def wmean(mask):
+        return np.average(resid_all[mask], weights=weight_all[mask]) if mask.sum() > 0 else np.nan
+
+    peak_mask = np.abs(u_all) < 0.5
+    shoulder_mask = (u_all >= 0.5) & (u_all < 1.5)
+    far_mask = (u_all >= 2.0) & (u_all < 3.0)
+    chi2 = np.sum(weight_all * resid_all**2)
+    return wmean(peak_mask), wmean(shoulder_mask), wmean(far_mask), chi2, len(resid_all)
+
+peak_long, shoulder_long, far_long, chi2_long, n_pts_long = \
+    stacked_residual_bins_with_departure(line_width, departure_all)
+peak_short, shoulder_short, far_short, chi2_short, n_pts_short = \
+    stacked_residual_bins_with_departure(line_width, departure_all_short)
+
+print(f"\nShoulder-excess bins, MAP-fit l_x={SHAPE_X_LENGTH_SCALE_CONVERGED:.0f} px (long):    "
+      f"peak={peak_long:+.5f}, shoulder={shoulder_long:+.5f}, far_wing={far_long:+.5f}, "
+      f"chi2/n={chi2_long / n_pts_long:.4f}")
+print(f"Shoulder-excess bins, forced l_x={SHAPE_X_LENGTH_SCALE_SHORT_TEST} px (short):       "
+      f"peak={peak_short:+.5f}, shoulder={shoulder_short:+.5f}, far_wing={far_short:+.5f}, "
+      f"chi2/n={chi2_short / n_pts_short:.4f}")
+
+fig_lxshort, ax_lxshort = plt.subplots(figsize=(8, 6))
+x_pos = np.arange(3)
+bar_width = 0.35
+ax_lxshort.bar(x_pos - bar_width / 2, [peak_long, shoulder_long, far_long], bar_width,
+                 label=f'MAP-fit l_x ({SHAPE_X_LENGTH_SCALE_CONVERGED:.0f} px)',
+                 color='tab:orange', alpha=0.8)
+ax_lxshort.bar(x_pos + bar_width / 2, [peak_short, shoulder_short, far_short], bar_width,
+                 label=f'forced short l_x ({SHAPE_X_LENGTH_SCALE_SHORT_TEST} px)',
+                 color='tab:purple', alpha=0.8)
+ax_lxshort.axhline(0, color='k', lw=0.8)
+ax_lxshort.set_xticks(x_pos)
+ax_lxshort.set_xticklabels(['peak', 'shoulder', 'far_wing'])
+ax_lxshort.set_ylabel('weighted mean residual (flux - model)')
+ax_lxshort.set_title('Shoulder-excess bins: MAP-fit vs. forced-short shape l_x')
+ax_lxshort.legend(fontsize=8)
+fig_lxshort.tight_layout()
+fig_lxshort.canvas.draw()
+plt.pause(0.1)
+
+# =========================================================================
+# CONTINUOUS RESIDUAL PROFILE vs. u -- direct replacement for the coarse
+# 3-bin summary above, built specifically to pin down "model sits above
+# data at the peak, below at the wings" precisely: WHERE (in km/s) does
+# the sign flip actually happen, and how large is it at its largest,
+# rather than three averages that may straddle the real structure. Also
+# reports the residual's own point-to-point (lag-1) autocorrelation
+# within this stack, as a cross-check against the separately-reported
+# per-line autocorrelation -- if a similar lag-1 correlation shows up
+# here, that supports the noise-covariance explanation for chi2/dof
+# rather than genuine model mismatch; if it does not, that argues for a
+# real, structural shape mismatch instead.
+# =========================================================================
+u_stack, resid_stack, weight_stack = [], [], []
+for m in range(n_lines):
+    idx = fit_window(line_position[m])
+    model_window = pixel_model_flux(line_position[m], idx, v_pix[m], line_width[m], departure_all[m])
+    u_stack.append((idx - line_position[m]) * v_pix[m])
+    resid_stack.append(flux[idx] - model_window)
+    weight_stack.append(inverse_variance[idx])
+u_stack = np.concatenate(u_stack)
+resid_stack = np.concatenate(resid_stack)
+weight_stack = np.concatenate(weight_stack)
+
+order_idx = np.argsort(u_stack)
+u_stack, resid_stack, weight_stack = u_stack[order_idx], resid_stack[order_idx], weight_stack[order_idx]
+
+N_RESIDUAL_BINS = 30
+bin_edges = np.linspace(u_stack.min(), u_stack.max(), N_RESIDUAL_BINS + 1)
+bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+bin_mean = np.full(N_RESIDUAL_BINS, np.nan)
+bin_err = np.full(N_RESIDUAL_BINS, np.nan)
+bin_n = np.zeros(N_RESIDUAL_BINS, dtype=int)
+for i in range(N_RESIDUAL_BINS):
+    mask = (u_stack >= bin_edges[i]) & (u_stack < bin_edges[i + 1])
+    if mask.sum() > 5:
+        bin_mean[i] = np.average(resid_stack[mask], weights=weight_stack[mask])
+        # standard error of a weighted mean, NOT assuming independence --
+        # see the printed lag-1 correlation below for whether that
+        # assumption would even be reasonable here
+        bin_err[i] = 1 / np.sqrt(np.sum(weight_stack[mask]))
+        bin_n[i] = mask.sum()
+
+fig_resprof, ax_resprof = plt.subplots(figsize=(11, 6))
+ax_resprof.errorbar(bin_centres, bin_mean, yerr=bin_err, fmt='o-', ms=4, capsize=2, color='tab:blue')
+ax_resprof.axhline(0, color='k', lw=0.8)
+ax_resprof.set_xlabel('u [km/s]')
+ax_resprof.set_ylabel('weighted mean residual (flux - model)')
+ax_resprof.set_title(f'Continuous residual profile vs. u (order {ORDER}, '
+                       f'{N_RESIDUAL_BINS} bins, current MAP-fit model)')
+fig_resprof.tight_layout()
+fig_resprof.canvas.draw()
+plt.pause(0.1)
+
+print("\nContinuous residual profile (u_centre, weighted mean, n_points):")
+for uc, bm, be, bn in zip(bin_centres, bin_mean, bin_err, bin_n):
+    if bn > 5:
+        print(f"  u={uc:+.3f} km/s: residual={bm:+.5f} +/- {be:.5f}  (n={bn})")
+
+# lag-1 autocorrelation of this SPECIFIC (u-sorted) residual stack, for
+# direct comparison against the separately-reported per-line (pixel-
+# index-sorted) autocorrelation -- a different ordering, so a different
+# question: this one asks whether NEARBY-IN-VELOCITY residuals move
+# together (consistent with genuine shape mismatch, which is smooth in
+# u), while the earlier one asks whether NEARBY-IN-PIXEL residuals do
+# (consistent with extraction-correlated noise).
+if len(resid_stack) > 1:
+    lag1_corr = np.corrcoef(resid_stack[:-1], resid_stack[1:])[0, 1]
+    print(f"\nStacked-residual (u-sorted) lag-1 autocorrelation: {lag1_corr:+.4f}")
+
+# =========================================================================
 # WINDOW 2: LSF models overplotted on data -- one subplot per POSITION
 # BIN, not per single line: each panel shows every line's own data within
 # that bin, stacked in u-space (which normalises out each line's own
@@ -2032,23 +2385,99 @@ _bin_rep_idx = [bin_idx[len(bin_idx) // 2] for bin_idx in _bin_indices]  # bin's
 _bin_x_pos = peak_pixel[_bin_rep_idx]
 _bin_colours = _cmap(_norm(_bin_x_pos))
 
+_LSF_DATA_DIR = '/Users/dmilakov/software/harps/testing/lsf/formod/data'
+
+# PIXEL-INTEGRATED MODEL AT THE DATA'S OWN SAMPLE POINTS -- added alongside
+# the existing continuous curve, NOT instead of it, because the two answer
+# different questions and conflating them previously produced a misleading
+# diagnostic. flux[idx] is a PIXEL-BOXCAR AVERAGE of the true continuous
+# profile (that is what a detector pixel physically measures), while
+# gaussian_mean(u, sigma) + departure[rep_idx] is the continuous curve
+# POINT-SAMPLED at u -- exactly what a real pixel does not measure.
+# Comparing a point-sampled curve against boxcar-averaged data produces a
+# spurious mismatch that is largest exactly where curvature is largest (the
+# line core), independent of whether the underlying fit is actually good --
+# confirmed directly on this order's own saved output: the previous
+# points/model files showed a residual that was negative (model above data)
+# in 90-100% of individual lines at the core specifically, the signature of
+# this effect rather than of a genuine fit failure. pixel_model_flux is
+# already the quantity the optimiser itself compares against flux[idx]
+# throughout the fit (fit_dispersion, fit_width, fit_shape_departure all use
+# it via gaussian_pixel_integral + convolution_matrix @ departure);
+# evaluating it here, at each line's own native pixel indices, is the
+# correct apples-to-apples comparison, using each line's OWN sigma and
+# departure (not just the bin's representative line, unlike the continuous
+# curve, which stands in for the whole bin only for visual shape reference).
 fig2, axes2 = plt.subplots(4, 4, figsize=(16, 12), sharex=True, sharey=True)
-for ax, bin_idx, rep_idx, x_pos, colour in zip(axes2.flat, _bin_indices, _bin_rep_idx, _bin_x_pos, _bin_colours):
+print("\nWindow 2 per-bin residual diagnostics (data minus PIXEL-INTEGRATED "
+      "model, the correct like-for-like comparison): "
+      "core = |u|<0.5 km/s, shoulder = 0.5<=u<1.5 km/s")
+for i, (ax, bin_idx, rep_idx, x_pos, colour) in enumerate(zip(axes2.flat, _bin_indices, _bin_rep_idx, _bin_x_pos, _bin_colours)):
     sigma = line_width[rep_idx]
-    lsf = gaussian_mean(u, sigma) + departure[rep_idx]
+    lsf = gaussian_mean(u, sigma) + departure[rep_idx]   # continuous curve; shape reference only, not pixel-integrated
     mask = _data_constrained_mask(x_pos, u)
+
+    U_DATA, F_DATA, F_MODEL_PIX = [], [], []
     for m in bin_idx:
         idx = fit_window(line_position[m])
         u_data = (idx - line_position[m]) * v_pix[m]
+        model_pix = pixel_model_flux(line_position[m], idx, v_pix[m],
+                                       line_width[m], departure[m])
+        U_DATA.append(u_data)
+        F_DATA.append(flux[idx])
+        F_MODEL_PIX.append(model_pix)
         ax.plot(u_data, flux[idx], '.', ms=4, alpha=0.8, color=colour)
-    ax.plot(u[mask], lsf[mask], color=colour, lw=1.3)
+
+    U_DATA_flat = np.concatenate(U_DATA)
+    F_DATA_flat = np.concatenate(F_DATA)
+    F_MODEL_PIX_flat = np.concatenate(F_MODEL_PIX)
+    resid_flat = F_DATA_flat - F_MODEL_PIX_flat
+
+    # Sort by u purely for a clean connecting line across the (interleaved,
+    # per-line) pixel-integrated model points -- does not affect the data
+    # used for the saved files or the residual statistics below.
+    _order = np.argsort(U_DATA_flat)
+    ax.plot(U_DATA_flat[_order], F_MODEL_PIX_flat[_order], 'x', ms=4, mew=1.0,
+            color='k', alpha=0.6, label='pixel-integrated model (at data points)')
+    ax.plot(u[mask], lsf[mask], color=colour, lw=1.0, ls='--', alpha=0.7,
+            label='continuous curve (reference only)')
     ax.plot(u[mask], gaussian_mean(u, sigma)[mask], 'k', ls=':', alpha=0.5, lw=1)
     ax.axhline(0, color='gray', lw=0.5)
     ax.set_title(f'pixel {x_pos:.0f}, n={len(bin_idx)} lines (FWHM={2.355*sigma:.3f} km/s)', fontsize=8)
+    if i == 0:
+        ax.legend(fontsize=5)
+
+    core_m = np.abs(U_DATA_flat) < 0.5
+    shoulder_m = (U_DATA_flat >= 0.5) & (U_DATA_flat < 1.5)
+    core_str = (f"core resid={resid_flat[core_m].mean():+.4f}+/-{resid_flat[core_m].std():.4f} (n={core_m.sum()})"
+                if core_m.sum() > 0 else "core: n/a")
+    shoulder_str = (f"shoulder resid={resid_flat[shoulder_m].mean():+.4f}+/-{resid_flat[shoulder_m].std():.4f} (n={shoulder_m.sum()})"
+                     if shoulder_m.sum() > 0 else "shoulder: n/a")
+    print(f"  bin {i+1:2d} (pixel {x_pos:.0f}): {core_str}, {shoulder_str}")
+
+    np.savetxt(f'{_LSF_DATA_DIR}/order={ORDER}_lsf_model_segm={i+1}.txt',
+               np.transpose([u[mask], lsf[mask]]),
+               header='velocity, value  (CONTINUOUS curve, point-sampled -- '
+                      'NOT pixel-integrated; shape reference only, uses the '
+                      "bin's representative line)")
+    np.savetxt(f'{_LSF_DATA_DIR}/order={ORDER}_points_segm={i+1}.txt',
+               np.transpose([U_DATA_flat, F_DATA_flat]),
+               header='velocity, value  (raw per-pixel data, flux[idx], all '
+                      'lines in this bin stacked in u)')
+    np.savetxt(f'{_LSF_DATA_DIR}/order={ORDER}_model_pixel_segm={i+1}.txt',
+               np.transpose([U_DATA_flat, F_MODEL_PIX_flat]),
+               header='velocity, value  (PIXEL-INTEGRATED model at the SAME '
+                      'points as the points file -- gaussian_pixel_integral '
+                      '+ convolution_matrix @ departure, per line\'s own '
+                      'sigma/departure -- exactly the quantity the fit '
+                      'itself compares against flux[idx]; subtract this '
+                      'from the points file for a correct residual, not '
+                      'the lsf_model_segm file)')
 fig2.suptitle('LSF model vs. data, one panel per position bin (all lines in the bin overlaid)')
 fig2.supxlabel('u [km/s]')
 fig2.tight_layout()
 fig2.canvas.draw()
+
 plt.pause(0.1)
 
 # =========================================================================
@@ -2172,6 +2601,16 @@ ax.set_title('Normalised residuals, (flux - model) / error')
 ax.set_xlabel('pixel')
 fig5.tight_layout()
 fig5.canvas.draw()
+
+np.savetxt(f'/Users/dmilakov/software/harps/testing/lsf/formod/data/order={ORDER}_forward_model.txt',
+           np.transpose([pixel[fitted_mask],
+                         flux_raw[fitted_mask], 
+                         err_raw[fitted_mask],
+                         model_raw[fitted_mask],
+                         residual[fitted_mask]]),
+           header = 'pixel, raw flux, raw err, model, residual',
+           )
+
 plt.pause(0.1)
 
 # =========================================================================

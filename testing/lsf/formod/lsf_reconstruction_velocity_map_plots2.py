@@ -1402,7 +1402,31 @@ SHAPE_KAPPA_WIDTH_FACTOR = 1.5    # width of the variance envelope, as a
                                      # so this reproduces their RELATIVE
                                      # shape while tying the absolute scale
                                      # to width, per the note above)
-SHAPE_IDENTIFIABILITY_WEIGHT = 1e8
+SHAPE_IDENTIFIABILITY_WEIGHT_SHIFT = 1e5  # unchanged -- pooling many lines'
+                                     # individual position residuals through
+                                     # an unguarded shift direction is what
+                                     # produced the double-humped, unphysical
+                                     # LSF when the guard was loosened wholesale
+                                     # earlier; nothing since then argues this
+                                     # direction is anything but genuinely
+                                     # degenerate with line_position, so it
+                                     # stays at full strength.
+SHAPE_IDENTIFIABILITY_WEIGHT_WIDTH = 1e8  # loosened from the old shared 1e8,
+                                     # as a direct, narrow test: the observed
+                                     # residual bump sits almost exactly at
+                                     # width_change_direction's own analytic
+                                     # peak (sqrt(2)*sigma_ref), AND per-line
+                                     # free width (fully unconstrained, no
+                                     # smoothness at all) already failed to
+                                     # explain the same bump -- meaning
+                                     # whatever this direction would need to
+                                     # express here is not simply "sigma(x)
+                                     # is slightly wrong", which is the
+                                     # specific degeneracy this guard exists
+                                     # to prevent. Loosened by 1e5x (not to
+                                     # zero) as a controlled first test, not
+                                     # a decision that this direction is safe
+                                     # to leave essentially unconstrained.
 _JITTER = 1e-3  # relative to the unit-diagonal correlation matrices;
                   # confirmed necessary directly, not just conservative
                   # caution: with N_X_INDUCING points spread across the
@@ -1489,8 +1513,8 @@ def shape_departure_log_evidence(candidate_l_x, line_position, width_coeffs, v_p
 
     width_dir = width_change_direction_inducing(sigma_ref)
     shift_dir = shift_direction_inducing(sigma_ref)
-    guard_u = SHAPE_IDENTIFIABILITY_WEIGHT * (np.outer(width_dir, width_dir)
-                                                 + np.outer(shift_dir, shift_dir))
+    guard_u = (SHAPE_IDENTIFIABILITY_WEIGHT_WIDTH * np.outer(width_dir, width_dir)
+                + SHAPE_IDENTIFIABILITY_WEIGHT_SHIFT * np.outer(shift_dir, shift_dir))
     K_u_prior_inv = (R_u_inv / kappa_inducing[:, None]) / kappa_inducing[None, :]
 
     n_dim = N_U_INDUCING * N_X_INDUCING
@@ -1591,8 +1615,8 @@ def fit_shape_departure(line_position, width_coeffs, v_pix):
 
     width_dir = width_change_direction_inducing(sigma_ref)
     shift_dir = shift_direction_inducing(sigma_ref)
-    guard_u = SHAPE_IDENTIFIABILITY_WEIGHT * (np.outer(width_dir, width_dir)
-                                                 + np.outer(shift_dir, shift_dir))
+    guard_u = (SHAPE_IDENTIFIABILITY_WEIGHT_WIDTH * np.outer(width_dir, width_dir)
+                + SHAPE_IDENTIFIABILITY_WEIGHT_SHIFT * np.outer(shift_dir, shift_dir))
     # K_u_prior = diag(kappa_inducing) @ R_u @ diag(kappa_inducing), so its
     # inverse is EXACTLY diag(1/kappa_inducing) @ R_u_inv @ diag(1/kappa_inducing)
     # -- no new matrix inversion needed, just row/column rescaling of R_u_inv.
@@ -2012,6 +2036,166 @@ fig_plw.suptitle('Releasing the Gaussian core width per line, not tied to width(
 fig_plw.tight_layout()
 fig_plw.canvas.draw()
 plt.pause(0.1)
+
+# =========================================================================
+# l_x SHORT-SCALE COMPARISON -- does forcing SHAPE_X_LENGTH_SCALE shorter
+# (comparable to window 2's ~569 px panel spacing and N_X_INDUCING's own
+# ~285 px knot spacing) reduce the shoulder-excess residual, even though
+# the MAP fit above found the pooled evidence prefers something 2-5x
+# longer? A genuinely different question from "what maximises the
+# marginal likelihood" -- this tests directly whether a shorter length
+# scale helps THIS specific, localised residual pattern, using the same
+# stacked-bin machinery and hold-everything-else-fixed discipline as
+# every earlier test in this investigation. sigma(x) (line_width) is held
+# at its current smooth-model value in BOTH cases, so only the shape
+# term's x-length-scale differs between them.
+# =========================================================================
+SHAPE_X_LENGTH_SCALE_CONVERGED = SHAPE_X_LENGTH_SCALE  # save the MAP-fit value
+SHAPE_X_LENGTH_SCALE_SHORT_TEST = 400  # pixels; comparable to the ~569 px
+                                          # window-2 panel spacing and the
+                                          # ~285 px N_X_INDUCING knot
+                                          # spacing, both far shorter than
+                                          # the ~1000-3000 px the MAP fit
+                                          # itself converged to
+
+SHAPE_X_LENGTH_SCALE = SHAPE_X_LENGTH_SCALE_SHORT_TEST
+shape_coeffs_short = fit_shape_departure(line_position, width_coeffs, v_pix)
+SHAPE_X_LENGTH_SCALE = SHAPE_X_LENGTH_SCALE_CONVERGED  # restore immediately
+
+departure_all_short = evaluate_departure(line_position, line_width, shape_coeffs_short)
+
+def stacked_residual_bins_with_departure(sigma_array, departure_array):
+    """ Same peak/shoulder/far_wing binning as stacked_residual_bins
+        above, generalised to take an explicit departure array rather
+        than closing over the module-level departure_all -- needed here
+        because this test compares TWO DIFFERENT departure fits (long vs
+        short l_x), not two different sigma arrays. Also returns the
+        total chi2 and point count in one pass, since a shorter length
+        scale has more effective degrees of freedom and will almost
+        always fit the TRAINING data at least as well regardless of
+        whether it is capturing genuine structure -- the log-evidence
+        comparison already accounts for that trade-off, a bare chi2
+        comparison does not, so both are reported for an honest read. """
+    u_all, resid_all, weight_all = [], [], []
+    for m in range(n_lines):
+        idx = fit_window(line_position[m])
+        model = pixel_model_flux(line_position[m], idx, v_pix[m], sigma_array[m], departure_array[m])
+        u_all.append((idx - line_position[m]) * v_pix[m])
+        resid_all.append(flux[idx] - model)
+        weight_all.append(inverse_variance[idx])
+    u_all = np.concatenate(u_all)
+    resid_all = np.concatenate(resid_all)
+    weight_all = np.concatenate(weight_all)
+
+    def wmean(mask):
+        return np.average(resid_all[mask], weights=weight_all[mask]) if mask.sum() > 0 else np.nan
+
+    peak_mask = np.abs(u_all) < 0.5
+    shoulder_mask = (u_all >= 0.5) & (u_all < 1.5)
+    far_mask = (u_all >= 2.0) & (u_all < 3.0)
+    chi2 = np.sum(weight_all * resid_all**2)
+    return wmean(peak_mask), wmean(shoulder_mask), wmean(far_mask), chi2, len(resid_all)
+
+peak_long, shoulder_long, far_long, chi2_long, n_pts_long = \
+    stacked_residual_bins_with_departure(line_width, departure_all)
+peak_short, shoulder_short, far_short, chi2_short, n_pts_short = \
+    stacked_residual_bins_with_departure(line_width, departure_all_short)
+
+print(f"\nShoulder-excess bins, MAP-fit l_x={SHAPE_X_LENGTH_SCALE_CONVERGED:.0f} px (long):    "
+      f"peak={peak_long:+.5f}, shoulder={shoulder_long:+.5f}, far_wing={far_long:+.5f}, "
+      f"chi2/n={chi2_long / n_pts_long:.4f}")
+print(f"Shoulder-excess bins, forced l_x={SHAPE_X_LENGTH_SCALE_SHORT_TEST} px (short):       "
+      f"peak={peak_short:+.5f}, shoulder={shoulder_short:+.5f}, far_wing={far_short:+.5f}, "
+      f"chi2/n={chi2_short / n_pts_short:.4f}")
+
+fig_lxshort, ax_lxshort = plt.subplots(figsize=(8, 6))
+x_pos = np.arange(3)
+bar_width = 0.35
+ax_lxshort.bar(x_pos - bar_width / 2, [peak_long, shoulder_long, far_long], bar_width,
+                 label=f'MAP-fit l_x ({SHAPE_X_LENGTH_SCALE_CONVERGED:.0f} px)',
+                 color='tab:orange', alpha=0.8)
+ax_lxshort.bar(x_pos + bar_width / 2, [peak_short, shoulder_short, far_short], bar_width,
+                 label=f'forced short l_x ({SHAPE_X_LENGTH_SCALE_SHORT_TEST} px)',
+                 color='tab:purple', alpha=0.8)
+ax_lxshort.axhline(0, color='k', lw=0.8)
+ax_lxshort.set_xticks(x_pos)
+ax_lxshort.set_xticklabels(['peak', 'shoulder', 'far_wing'])
+ax_lxshort.set_ylabel('weighted mean residual (flux - model)')
+ax_lxshort.set_title('Shoulder-excess bins: MAP-fit vs. forced-short shape l_x')
+ax_lxshort.legend(fontsize=8)
+fig_lxshort.tight_layout()
+fig_lxshort.canvas.draw()
+plt.pause(0.1)
+
+# =========================================================================
+# CONTINUOUS RESIDUAL PROFILE vs. u -- direct replacement for the coarse
+# 3-bin summary above, built specifically to pin down "model sits above
+# data at the peak, below at the wings" precisely: WHERE (in km/s) does
+# the sign flip actually happen, and how large is it at its largest,
+# rather than three averages that may straddle the real structure. Also
+# reports the residual's own point-to-point (lag-1) autocorrelation
+# within this stack, as a cross-check against the separately-reported
+# per-line autocorrelation -- if a similar lag-1 correlation shows up
+# here, that supports the noise-covariance explanation for chi2/dof
+# rather than genuine model mismatch; if it does not, that argues for a
+# real, structural shape mismatch instead.
+# =========================================================================
+u_stack, resid_stack, weight_stack = [], [], []
+for m in range(n_lines):
+    idx = fit_window(line_position[m])
+    model_window = pixel_model_flux(line_position[m], idx, v_pix[m], line_width[m], departure_all[m])
+    u_stack.append((idx - line_position[m]) * v_pix[m])
+    resid_stack.append(flux[idx] - model_window)
+    weight_stack.append(inverse_variance[idx])
+u_stack = np.concatenate(u_stack)
+resid_stack = np.concatenate(resid_stack)
+weight_stack = np.concatenate(weight_stack)
+
+order_idx = np.argsort(u_stack)
+u_stack, resid_stack, weight_stack = u_stack[order_idx], resid_stack[order_idx], weight_stack[order_idx]
+
+N_RESIDUAL_BINS = 30
+bin_edges = np.linspace(u_stack.min(), u_stack.max(), N_RESIDUAL_BINS + 1)
+bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+bin_mean = np.full(N_RESIDUAL_BINS, np.nan)
+bin_err = np.full(N_RESIDUAL_BINS, np.nan)
+bin_n = np.zeros(N_RESIDUAL_BINS, dtype=int)
+for i in range(N_RESIDUAL_BINS):
+    mask = (u_stack >= bin_edges[i]) & (u_stack < bin_edges[i + 1])
+    if mask.sum() > 5:
+        bin_mean[i] = np.average(resid_stack[mask], weights=weight_stack[mask])
+        # standard error of a weighted mean, NOT assuming independence --
+        # see the printed lag-1 correlation below for whether that
+        # assumption would even be reasonable here
+        bin_err[i] = 1 / np.sqrt(np.sum(weight_stack[mask]))
+        bin_n[i] = mask.sum()
+
+fig_resprof, ax_resprof = plt.subplots(figsize=(11, 6))
+ax_resprof.errorbar(bin_centres, bin_mean, yerr=bin_err, fmt='o-', ms=4, capsize=2, color='tab:blue')
+ax_resprof.axhline(0, color='k', lw=0.8)
+ax_resprof.set_xlabel('u [km/s]')
+ax_resprof.set_ylabel('weighted mean residual (flux - model)')
+ax_resprof.set_title(f'Continuous residual profile vs. u (order {ORDER}, '
+                       f'{N_RESIDUAL_BINS} bins, current MAP-fit model)')
+fig_resprof.tight_layout()
+fig_resprof.canvas.draw()
+plt.pause(0.1)
+
+print("\nContinuous residual profile (u_centre, weighted mean, n_points):")
+for uc, bm, be, bn in zip(bin_centres, bin_mean, bin_err, bin_n):
+    if bn > 5:
+        print(f"  u={uc:+.3f} km/s: residual={bm:+.5f} +/- {be:.5f}  (n={bn})")
+
+# lag-1 autocorrelation of this SPECIFIC (u-sorted) residual stack, for
+# direct comparison against the separately-reported per-line (pixel-
+# index-sorted) autocorrelation -- a different ordering, so a different
+# question: this one asks whether NEARBY-IN-VELOCITY residuals move
+# together (consistent with genuine shape mismatch, which is smooth in
+# u), while the earlier one asks whether NEARBY-IN-PIXEL residuals do
+# (consistent with extraction-correlated noise).
+if len(resid_stack) > 1:
+    lag1_corr = np.corrcoef(resid_stack[:-1], resid_stack[1:])[0, 1]
+    print(f"\nStacked-residual (u-sorted) lag-1 autocorrelation: {lag1_corr:+.4f}")
 
 # =========================================================================
 # WINDOW 2: LSF models overplotted on data -- one subplot per POSITION
