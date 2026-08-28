@@ -60,7 +60,7 @@ EXPECTED_FWHM_KMS = SPEED_OF_LIGHT_KMS / EXPECTED_R
 
 
 DATA_SOURCE = 'spectrum'   # 'file' or 'harps
-ORDER = 85             # echelle order to use; only read when DATA_SOURCE == 'spectrum'
+ORDER = 90             # echelle order to use; only read when DATA_SOURCE == 'spectrum'
 
 FILENAME = ('/Users/dmilakov/projects/j1333/lfc/LFC_reduced_files/'
            '2023-02-22_ESPRESSO_S2D_LFC_FP_A.fits')
